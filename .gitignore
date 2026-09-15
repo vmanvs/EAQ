@@ -1,1 +1,7 @@
 private-docs/
+.venv*/
+.cache/
+__pycache__/
+artifacts/
+data/
+weights/
