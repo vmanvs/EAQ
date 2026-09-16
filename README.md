@@ -25,6 +25,13 @@ allocations will be compared with a universal allocation across conditions.
 Early research development. Model and benchmark feasibility are being evaluated.
 A reproducible policy baseline and quantization results are not yet available.
 
+## Cloud validation
+
+Start with [the Kaggle preflight notebook](notebooks/01_kaggle_preflight.ipynb)
+to check GPU execution, headless rendering, and model-resource access before
+downloading weights. See [setup and output instructions](docs/kaggle.md).
+This validates infrastructure; it does not run the policy or benchmark.
+
 ## Experimental approach
 
 1. Reproduce a reference policy on a defined task subset.
