@@ -27,10 +27,12 @@ A reproducible policy baseline and quantization results are not yet available.
 
 ## Cloud validation
 
-Start with [the Kaggle preflight notebook](notebooks/01_kaggle_preflight.ipynb)
+The first cloud run uses [the Molab preflight notebook](notebooks/01_molab_preflight.py)
 to check GPU execution, headless rendering, and model-resource access before
-downloading weights. See [setup and output instructions](docs/kaggle.md).
-This validates infrastructure; it does not run the policy or benchmark.
+downloading weights. After pushing it to GitHub, follow the
+[Molab setup and run guide](docs/molab.md). This validates infrastructure; it
+does not run the policy or benchmark. The earlier
+[Kaggle preflight](docs/kaggle.md) remains available as an alternative.
 
 ## Experimental approach
 
