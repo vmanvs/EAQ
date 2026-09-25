@@ -536,8 +536,11 @@ def cmake_cuda_check(workdir):
                       f"-DCMAKE_CUDA_COMPILER={toolkit['path']}", f"-DCUDAToolkit_ROOT={toolkit['toolkit_root']}",
                       f"-DCMAKE_CUDA_ARCHITECTURES={arch}", "-DCMAKE_BUILD_TYPE=Release"]
     attempts = [("as installed", [])]
+    toolkit_lib = str(Path(toolkit["toolkit_root"], "lib"))
     if toolkit["source"] == "pip wheel":
-        attempts.append(("with unversioned .so links", None))
+        # pip toolkits ship only versioned sonames (link step) and live off the loader path (run step):
+        # PyTorch preloads them itself, but a freshly built binary must carry an RPATH to them.
+        attempts.append(("with unversioned .so links and toolkit RPATH", None))
     result = {"nvcc": toolkit, "cuda_architectures": arch, "attempts": []}
     for label, extra in attempts:
         build_dir = workdir / f"build-{len(result['attempts'])}"
@@ -545,7 +548,7 @@ def cmake_cuda_check(workdir):
         if extra is None:
             shim = workdir / "libshim"
             attempt["linked"] = _unversioned_library_shim(toolkit["toolkit_root"], shim)
-            extra = [f"-DCMAKE_LIBRARY_PATH={shim}"]
+            extra = [f"-DCMAKE_LIBRARY_PATH={shim}", f"-DCMAKE_BUILD_RPATH={toolkit_lib}"]
         attempt["configure"] = _run([*base_arguments, "-B", str(build_dir), *extra], timeout=300)
         if attempt["configure"]["returncode"] == 0:
             attempt["build"] = _run([cmake, "--build", str(build_dir)], timeout=600)
@@ -554,6 +557,11 @@ def cmake_cuda_check(workdir):
                                if path.is_file() and path.name in ("probe", "probe.exe")), None)
                 attempt["run"] = (_run([str(binary)], timeout=120) if binary
                                   else {"returncode": None, "output": "binary not found"})
+                if binary and "error while loading shared libraries" in attempt["run"]["output"]:
+                    # Diagnostic only: does the binary work once the loader can see the toolkit's libraries?
+                    env = dict(os.environ, LD_LIBRARY_PATH=os.pathsep.join(
+                        filter(None, [toolkit_lib, os.environ.get("LD_LIBRARY_PATH")])))
+                    attempt["run_with_ld_library_path"] = _run([str(binary)], timeout=120, env=env)
         result["attempts"].append(attempt)
         run = attempt.get("run", {})
         if run.get("returncode") == 0 and run.get("output", "").startswith("OK"):
@@ -563,8 +571,8 @@ def cmake_cuda_check(workdir):
     if "working_setup" not in result:
         blockers.append("No CMake setup could configure, build and run a CUDA + cuBLAS binary (ggml-cuda needs this).")
     elif result["working_setup"] != "as installed":
-        adaptations.append("CMake needs unversioned CUDA library links (lib*.so -> lib*.so.N) for the pip toolkit; "
-                           "create them before building ActQuant and record it.")
+        adaptations.append("Pip CUDA toolkit: before building ActQuant, create unversioned lib*.so links and pass "
+                           f"-DCMAKE_BUILD_RPATH={toolkit_lib} (or set LD_LIBRARY_PATH at run time); record both.")
     result.update(blockers=blockers, adaptations=adaptations)
     return result
 
