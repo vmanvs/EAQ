@@ -1,6 +1,8 @@
-"""Validate a Linux GPU runtime before downloading LaWAM weights.
+"""Validate a Linux GPU runtime before downloading LaWAM or ActQuant weights.
 
 This checks infrastructure, not model correctness or LIBERO task success.
+The ActQuant group (see actquant_probe.py) tests whether ActQuant's Pi 0.5
+build-and-evaluate path can run on this host.
 """
 from __future__ import annotations
 
@@ -15,12 +17,15 @@ import shutil
 import subprocess
 import time
 
+import actquant_probe
+
 
 MODELS = {
     "policy": ("jialei02/lawam_libero_sft_release", "b09a207ffcde367e71439621eb1679f941b4f026", "config.yaml"),
     "lam": ("jialei02/lawam_lam", "bd993da2a0861afaac5a95ac86d2555b1313ab8c", "dino_large_vae.yaml"),
     "qwen": ("Qwen/Qwen3-VL-2B-Instruct", "89644892e4d85e24eaac8bacfd4f463576704203", "config.json"),
     "dino": ("facebook/dinov3-vitb16-pretrain-lvd1689m", "5931719e67bbdb9737e363e781fb0c67687896bc", "config.json"),
+    **actquant_probe.MODELS,
 }
 LAWAM_REVISION = "7d27b9607c22034934a4b70347f8bfaba92bf692"
 
@@ -120,43 +125,63 @@ def access_check(label, output_dir):
         raise RuntimeError(f"{label}: metadata access failed ({type(exc).__name__}, HTTP {code}). Check Internet, HF_TOKEN, and model access approval.") from None
     return {"repo": repo, "revision": info.sha, "config_bytes": Path(path).stat().st_size,
             "weight_files": [{"name": f.rfilename, "bytes": f.size} for f in info.siblings
-                             if f.rfilename.endswith((".pt", ".safetensors"))]}
+                             if f.rfilename.endswith((".pt", ".safetensors", ".gguf"))]}
+
+
+def build_checks(output_dir, group):
+    base = {"runtime": runtime_check, "attention": attention_check,
+            "render": lambda: render_check(output_dir)}
+    access = {f"access_{label}": lambda label=label: access_check(label, output_dir) for label in MODELS}
+    actquant = {f"actquant_{name}": lambda check=check: check(output_dir)
+                for name, check in actquant_probe.CHECKS.items()}
+    actquant.update({name: check for name, check in access.items()
+                     if name.removeprefix("access_") in actquant_probe.MODELS})
+    if group == "all":
+        return {**base, **access, **actquant}
+    if group == "access":
+        return access
+    if group == "actquant":
+        return actquant
+    return {group: base[group]}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--only", choices=["all", "runtime", "attention", "render", "access"], default="all")
+    parser.add_argument("--only", choices=["all", "runtime", "attention", "render", "access", "actquant"], default="all")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     git = subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1],
                          capture_output=True, text=True, check=False)
-    report = {"schema_version": 1, "scope": "preflight only; no policy inference or task success",
+    report = {"schema_version": 2, "scope": "preflight only; no policy inference or task success",
               "started_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
               "eaq_commit": git.stdout.strip() if git.returncode == 0 else None,
-              "lawam_revision": LAWAM_REVISION, "python": platform.python_version(),
+              "lawam_revision": LAWAM_REVISION, "actquant_sources": actquant_probe.SOURCES,
+              "python": platform.python_version(),
               "platform": platform.system(), "disk_free_gib": shutil.disk_usage(args.output).free / 2**30,
               "checks": {}}
     packages = sorted(f"{dist.metadata['Name']}=={dist.version}" for dist in importlib.metadata.distributions())
     (args.output / "packages.txt").write_text("\n".join(packages) + "\n", encoding="utf-8")
-    checks = {"runtime": runtime_check, "attention": attention_check,
-              "render": lambda: render_check(args.output)}
-    if args.only in ("all", "access"):
-        checks.update({f"access_{label}": lambda label=label: access_check(label, args.output) for label in MODELS})
-    if args.only not in ("all", "access"):
-        checks = {args.only: checks[args.only]}
-    elif args.only == "access":
-        checks = {key: value for key, value in checks.items() if key.startswith("access_")}
-    for name, check in checks.items():
+    for name, check in build_checks(args.output, args.only).items():
         try:
-            report["checks"][name] = {"status": "passed", "details": check()}
+            details = check()
+            blockers = details.get("blockers") if isinstance(details, dict) else None
+            if blockers:
+                # Probe checks keep their evidence even when they find a blocker.
+                report["checks"][name] = {"status": "failed", "error": "; ".join(blockers), "details": details}
+            else:
+                report["checks"][name] = {"status": "passed", "details": details}
         except Exception as exc:
             # Access errors are sanitized above; do not serialize arbitrary remote responses.
             message = str(exc) if name.startswith("access_") else f"{type(exc).__name__}: {exc}"
             report["checks"][name] = {"status": "failed", "error": message}
         report["passed"] = all(item["status"] == "passed" for item in report["checks"].values())
+        if args.only in ("all", "actquant"):
+            report["actquant_verdict"] = actquant_probe.verdict(report["checks"])
         (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(f"{name}: {report['checks'][name]['status']}", flush=True)
+    if "actquant_verdict" in report:
+        print(f"ActQuant verdict: {report['actquant_verdict']['status']}")
     print(f"Report: {args.output / 'report.json'}")
     return 0 if report["passed"] else 1
 

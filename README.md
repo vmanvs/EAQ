@@ -29,7 +29,8 @@ A reproducible policy baseline and quantization results are not yet available.
 
 The first cloud run uses [the Molab preflight notebook](notebooks/01_molab_preflight.py)
 to check GPU execution, headless rendering, and model-resource access before
-downloading weights. After pushing it to GitHub, follow the
+downloading weights. It also probes whether the host can build and run
+[ActQuant](https://github.com/arashakb/ActQuant)'s Pi 0.5 pipeline. After pushing it to GitHub, follow the
 [Molab setup and run guide](docs/molab.md). This validates infrastructure; it
 does not run the policy or benchmark. The earlier
 [Kaggle preflight](docs/kaggle.md) remains available as an alternative.

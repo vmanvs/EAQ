@@ -52,6 +52,14 @@ def _(mo):
         checks access to pinned model configuration metadata. It does **not** load
         LaWAM, download full checkpoints or datasets, or run LIBERO.
 
+        It also probes whether this host can run **ActQuant's Pi 0.5 path**: CUDA
+        toolkit and build tools, root/apt access, disk space, compiling and running
+        a small CUDA + cuBLAS kernel for the attached GPU (native and PTX-JIT, via
+        nvcc and via CMake), a loopback socket, and pinned source/checkpoint
+        access. The result is summarized as an ActQuant verdict: `ready`,
+        `ready_with_adaptations`, or `blocked`. The probe compiles only a tiny
+        test kernel in the run folder; it installs nothing.
+
         The runtime and package inventory below do not install packages or fetch
         data. Click **Run bounded preflight** to run the repository script. That
         script may fetch small pinned configuration files from Hugging Face; it
@@ -351,7 +359,7 @@ def _(
                     stderr=subprocess.STDOUT,
                     text=True,
                     check=False,
-                    timeout=15 * 60,
+                    timeout=20 * 60,
                 )
                 (run_dir / "preflight.log").write_text(
                     process.stdout or "", encoding="utf-8"
@@ -361,7 +369,7 @@ def _(
                 if isinstance(partial_output, bytes):
                     partial_output = partial_output.decode("utf-8", errors="replace")
                 execution_error = (
-                    "Preflight timed out after 15 minutes; the process was stopped. "
+                    "Preflight timed out after 20 minutes; the process was stopped. "
                     "Any partial report.json has been retained."
                 )
                 (run_dir / "preflight.log").write_text(
@@ -440,11 +448,11 @@ def _(io, json, mo, Path, run_result, ZIP_DEFLATED, ZipFile):
                 mo.md(f"**Report read error:** `{run_result['report_error']}`")
             )
 
-        report = run_result["report"]
-        if report is not None:
+        _report = run_result["report"]
+        if _report is not None:
             failures = [
                 (name, details)
-                for name, details in report.get("checks", {}).items()
+                for name, details in _report.get("checks", {}).items()
                 if details.get("status") == "failed"
             ]
             if failures:
@@ -456,10 +464,20 @@ def _(io, json, mo, Path, run_result, ZIP_DEFLATED, ZipFile):
             else:
                 output_items.append(mo.md("No failed checks are listed in the report."))
 
+            _verdict = _report.get("actquant_verdict")
+            if _verdict is not None:
+                _blockers = "\n".join(f"- {item}" for item in _verdict["blockers"]) or "- none"
+                _adaptations = "\n".join(f"- {item}" for item in _verdict["adaptations"]) or "- none"
+                output_items.append(mo.md(
+                    f"### ActQuant verdict: `{_verdict['status']}`\n\n"
+                    f"**Blockers**\n\n{_blockers}\n\n"
+                    f"**Adaptations to record**\n\n{_adaptations}"
+                ))
+
             output_items.append(
                 mo.md(
                     "### `report.json`\n\n```json\n"
-                    + json.dumps(report, indent=2)
+                    + json.dumps(_report, indent=2)
                     + "\n```"
                 )
             )
@@ -478,12 +496,12 @@ def _(io, json, mo, Path, run_result, ZIP_DEFLATED, ZipFile):
                 )
             )
 
-        run_dir = Path(run_result["run_dir"])
+        _run_dir = Path(run_result["run_dir"])
         archive_buffer = io.BytesIO()
         with ZipFile(archive_buffer, mode="w", compression=ZIP_DEFLATED) as archive:
-            for artifact in sorted(run_dir.rglob("*")):
+            for artifact in sorted(_run_dir.rglob("*")):
                 if artifact.is_file():
-                    archive.write(artifact, artifact.relative_to(run_dir))
+                    archive.write(artifact, artifact.relative_to(_run_dir))
         output_items.append(
             mo.download(
                 data=archive_buffer.getvalue(),
