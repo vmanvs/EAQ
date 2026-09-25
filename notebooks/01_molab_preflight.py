@@ -142,7 +142,7 @@ def _(Path, mo, os, subprocess):
             return None, None, f"Could not fetch {repo}@{ref}: {type(exc).__name__}"
         return root, commit, None
 
-    FETCHED_FILES = ("scripts/cloud_preflight.py", "scripts/actquant_probe.py", "requirements/preflight.txt")
+    FETCHED_FILES = ("scripts/cloud_preflight.py", "requirements/preflight.txt")
     repository_root, preflight_script, requirements_file = locate_repository()
     repository_source = "local checkout" if repository_root is not None else None
     fetch_error = None

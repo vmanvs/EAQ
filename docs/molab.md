@@ -7,8 +7,8 @@ notebook is a marimo `.py` file; GitHub is the source of truth for its code.
 ## After pushing to GitHub
 
 1. Confirm that `notebooks/01_molab_preflight.py`,
-   `scripts/cloud_preflight.py`, `scripts/actquant_probe.py`, and
-   `requirements/preflight.txt` are on the same branch. Copy the pushed commit SHA for the run record.
+   `scripts/cloud_preflight.py`, and `requirements/preflight.txt` are on the
+   same branch. Copy the pushed commit SHA for the run record.
 2. Sign in to [Molab](https://molab.marimo.io/). On the home page, use the
    **new notebook** dropdown to add a notebook from GitHub. Paste the GitHub
    URL of `notebooks/01_molab_preflight.py`. Later pushes to that branch update
@@ -41,8 +41,8 @@ manually for now; automatic Drive artifact transfer is a later step.
 
 Molab's GitHub sync brings down only the notebook file, not the rest of the
 repository. When `scripts/cloud_preflight.py` is not next to the notebook, the
-notebook downloads `scripts/cloud_preflight.py`, `scripts/actquant_probe.py`,
-and `requirements/preflight.txt` from `vmanvs/EAQ` through the GitHub API.
+notebook downloads `scripts/cloud_preflight.py` and
+`requirements/preflight.txt` from `vmanvs/EAQ` through the GitHub API.
 It first resolves the branch to a commit, then records that commit as the
 run's `eaq_commit`. Set `EAQ_GIT_REF` (default `main`) or `EAQ_GITHUB_REPO`
 in Molab Secrets to change the source. A private repository also needs a
