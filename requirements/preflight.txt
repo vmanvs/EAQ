@@ -6,3 +6,6 @@ huggingface_hub==0.34.4
 # Build tools for the ActQuant CUDA/CMake checks (pip wheels ship the binaries).
 cmake==4.4.3
 ninja==1.13.2
+# CUDA 13.3 CCCL headers (nv/target, include/cccl). PyTorch cu130 installs nvcc 13.3
+# into site-packages/nvidia/cu13 but not CCCL. Match nvcc if Molab's torch changes.
+nvidia-cuda-cccl==13.3.3.4.1

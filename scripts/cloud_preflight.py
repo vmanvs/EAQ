@@ -325,6 +325,10 @@ def toolchain_check():
     if nvcc and nvcc[0]["source"] == "pip wheel":
         adaptations.append(f"CUDA toolkit comes from pip wheels at {nvcc[0]['toolkit_root']}, not a system install; "
                            "build ActQuant with -DCUDAToolkit_ROOT pointing there and record it.")
+        # PyTorch pulls in nvcc but not CCCL (libcu++/CUB/Thrust); cuda_fp16.h needs its <nv/target>.
+        if not Path(nvcc[0]["toolkit_root"], "include", "nv", "target").is_file():
+            blockers.append(f"pip CUDA toolkit lacks CCCL headers (nv/target); install nvidia-cuda-cccl matching "
+                            f"nvcc {nvcc[0]['version']} (pinned in requirements/preflight.txt).")
     return {"tools": tools, "nvcc": nvcc, "blockers": blockers, "adaptations": adaptations}
 
 
@@ -334,6 +338,8 @@ def system_access_check():
     can_elevate = euid == 0 or sudo["returncode"] == 0
     apt = shutil.which("apt-get")
     apt_simulation = None
+    # "Unable to locate package" for everything usually means apt-get update never ran.
+    apt_lists_present = any(Path("/var/lib/apt/lists").glob("*_Packages*"))
     if apt:
         # ActQuant's README names libegl1-mesa-dev; Debian 13 ships the headers as libegl-dev.
         for package in ("libegl1-mesa-dev", "libegl-dev"):
@@ -360,11 +366,14 @@ def system_access_check():
         blockers.append("No libEGL and no root/apt to install libegl1-mesa-dev; headless LIBERO rendering needs EGL.")
     if not can_elevate:
         adaptations.append("No root or passwordless sudo: only user-space installs (pip/uv/conda) are possible.")
+    elif apt and not apt_lists_present:
+        adaptations.append("apt package lists are empty; run apt-get update before any apt install.")
     if not pythons["3.8"]:
         adaptations.append("No Python 3.8 found; the LIBERO client needs it (uv python install 3.8 downloads one).")
     return {"os": os_release.get("PRETTY_NAME", platform.platform()), "glibc": "-".join(platform.libc_ver()),
             "euid": euid, "passwordless_sudo": sudo["returncode"] == 0, "can_install_system_packages": bool(can_elevate and apt),
-            "apt_get": apt, "apt_simulate_libegl": apt_simulation, "libEGL": egl_library,
+            "apt_get": apt, "apt_lists_present": apt_lists_present, "apt_simulate_libegl": apt_simulation,
+            "libEGL": egl_library,
             "site_packages_writable": os.access(purelib, os.W_OK), "pythons": pythons,
             "blockers": blockers, "adaptations": adaptations}
 
@@ -434,13 +443,18 @@ def cuda_compile_check(workdir):
     elif not native["ran"]:
         adaptations.append(f"nvcc {nvcc[0]['version']} cannot target sm_{arch} natively; only the PTX-JIT build runs "
                            "(slower first load, possibly slower kernels). Install a newer CUDA toolkit if possible.")
+    driver_cuda = driver_cuda_version()
+    if (_parse_version(nvcc[0]["version"]) or (0, 0)) > (_parse_version(driver_cuda) or (99, 0)):
+        adaptations.append(f"nvcc {nvcc[0]['version']} is newer than the driver's CUDA {driver_cuda}: native "
+                           "device code runs, but the driver cannot JIT this nvcc's PTX. Build for the exact GPU "
+                           "architecture, or use a toolkit no newer than the driver.")
     if capability >= (12, 0) and (_parse_version(nvcc[0]["version"]) or (0, 0)) < BLACKWELL_MIN_NVCC:
         adaptations.append("Blackwell GPU with CUDA toolkit < 12.8; ActQuant was tested with 12.6 (Pi 0.5).")
     if native["ran"] and arch not in DEFAULT_REAL_ARCHS:
         adaptations.append(f"Build ActQuant with -DCMAKE_CUDA_ARCHITECTURES={arch}; the fork's default list has no "
                            f"sm_{arch} device code and would fall back to PTX JIT.")
     return {"nvcc": nvcc[0], "compute_capability": f"{capability[0]}.{capability[1]}",
-            "driver_cuda_version": driver_cuda_version(), "native": native, "ptx_jit_compute_80": ptx,
+            "driver_cuda_version": driver_cuda, "native": native, "ptx_jit_compute_80": ptx,
             "blockers": blockers, "adaptations": adaptations}
 
 

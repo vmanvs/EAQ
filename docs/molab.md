@@ -20,8 +20,8 @@ notebook is a marimo `.py` file; GitHub is the source of truth for its code.
 4. Review the notebook's runtime and package inventory. If a direct preflight
    dependency is missing, install the version listed in
    `requirements/preflight.txt` from the sidebar's **Packages** panel. On
-   Molab that is typically `mujoco`, `cmake`, and `ninja`; reinstall them in
-   each new session. Keep Molab's installed PyTorch; it also supplies the CUDA
+   Molab that is typically `mujoco`, `cmake`, `ninja`, and `nvidia-cuda-cccl`
+   (CUDA headers PyTorch omits); reinstall them in each new session. Keep Molab's installed PyTorch; it also supplies the CUDA
    13 toolkit (`nvcc` under `site-packages/nvidia/cu13`) that the ActQuant
    checks use. Do not install LaWAM's full requirements yet.
 5. For the gated access checks, ensure the Hugging Face account has
