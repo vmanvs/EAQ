@@ -154,7 +154,7 @@ through the GitHub API.
 
 | Stage | What it does |
 | --- | --- |
-| `toolkit` | Installs the pinned CUDA 13.0 wheels (about 0.5 GB) into the work folder. It then checks that nvcc, the runtime headers and CCCL agree and that nvcc is not newer than the driver, and compiles a CUB + `cuda_fp16` kernel for the GPU |
+| `toolkit` | Installs the pinned CUDA 13.0 wheels (about 0.5 GB) into the work folder. It then checks that nvcc, the runtime headers and CCCL agree and that nvcc is not newer than the driver. It adds a `lib64 → lib` link, because the 13.0 nvcc wheel's `nvcc.profile` expects the system-install layout. Finally it compiles, links and runs a CUB + `cuda_fp16` kernel on the GPU |
 | `source` | Fetches ActQuant at its pinned commit and unpacks `vendor/tokenizers-cpp.zip` |
 | `configure` | Runs CMake with the recipe's flags and `LLAMA_CURL=OFF`; enables the `pi05.so` binding when `pybind11` and `Python.h` are available, and retries without it otherwise |
 | `build` | Builds `pi05`, `llama-quantize` and, if enabled, `pi05.so`; checks with `ldd` that every library resolves |

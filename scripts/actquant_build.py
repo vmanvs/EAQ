@@ -59,12 +59,25 @@ CHECKPOINT_FILES = {
 BUILD_TARGETS = ("pi05", "llama-quantize")
 DEFAULT_PROMPT = "put the black bowl on the plate"
 STAGES = ("toolkit", "source", "configure", "build", "download", "infer")
-# Compiled by the toolkit stage: the first build failed only in the one ggml file using CUB.
+# Compiled, linked and run by the toolkit stage, as CMake's compiler check and the build will:
+# build 1 failed in the one ggml file using CUB, build 2 at CMake's link test.
 TOOLKIT_PROBE = """
+#include <cstdio>
 #include <cuda_fp16.h>
 #include <cub/cub.cuh>
 __global__ void eaq_probe(const half *x, float *y) { y[threadIdx.x] = __half2float(x[threadIdx.x]); }
-int main() { return 0; }
+int main() {
+    half *x; float *y;
+    if (cudaMalloc(&x, 32 * sizeof(half)) != cudaSuccess || cudaMalloc(&y, 32 * sizeof(float)) != cudaSuccess) {
+        printf("FAIL malloc\\n"); return 2;
+    }
+    cudaMemset(x, 0, 32 * sizeof(half));
+    eaq_probe<<<1, 32>>>(x, y);
+    cudaError_t err = cudaDeviceSynchronize();
+    int runtime = 0, driver = 0; cudaRuntimeGetVersion(&runtime); cudaDriverGetVersion(&driver);
+    printf("%s runtime=%d driver=%d\\n", err == cudaSuccess ? "OK" : cudaGetErrorString(err), runtime, driver);
+    return err == cudaSuccess ? 0 : 3;
+}
 """
 TIMEOUTS = {"configure": 15 * 60, "build": 3 * 60 * 60, "infer": 20 * 60}
 
@@ -417,16 +430,30 @@ class Builder:
                              f"{wanted[0]}.{wanted[1]}.", details)
         self._require_toolkit()
 
-        # Compile (not run) CUB + cuda_fp16 for this GPU: seconds here instead of a failed long build.
+        # The 13.0 nvcc wheel's nvcc.profile still searches lib64 (the system-install layout), while
+        # the wheels install into lib; later wheels fixed the profile. A link keeps nvcc's default
+        # link step (-lcudadevrt -lcudart_static) working, which CMake's compiler check relies on.
+        root = Path(self.toolkit["root"])
+        if not (root / "lib64").exists():
+            (root / "lib64").symlink_to("lib", target_is_directory=True)
+            details["lib64_link"] = "created lib64 -> lib"
+
+        # Compile, link and run CUB + cuda_fp16 for this GPU: seconds here instead of a failed long build.
         if self.arch:
             probe_dir = self.output / "toolkit_probe"
             probe_dir.mkdir(exist_ok=True)
             (probe_dir / "probe.cu").write_text(TOOLKIT_PROBE, encoding="utf-8")
-            result = _run([self.toolkit["nvcc"], "-std=c++17", f"-arch=sm_{self.arch}", "-c",
-                           probe_dir / "probe.cu", "-o", probe_dir / "probe.o"], timeout=300)
-            details["cub_compile"] = {"returncode": result["returncode"], "output": result["output"][-2000:]}
+            result = _run([self.toolkit["nvcc"], "-std=c++17", f"-arch=sm_{self.arch}",
+                           probe_dir / "probe.cu", "-o", probe_dir / "probe"], timeout=300)
+            details["probe_build"] = {"returncode": result["returncode"], "output": result["output"][-2000:]}
             if result["returncode"] != 0:
-                raise StageError("The pinned toolkit cannot compile CUB for this GPU (see cub_compile).", details)
+                raise StageError("The pinned toolkit cannot compile and link CUB for this GPU "
+                                 "(see probe_build).", details)
+            result = _run([probe_dir / "probe"], timeout=120)
+            details["probe_run"] = {"returncode": result["returncode"], "output": result["output"][-500:]}
+            if result["returncode"] != 0:
+                raise StageError("The probe built by the pinned toolkit does not run on this GPU "
+                                 "(see probe_run).", details)
         self.deviation("toolkit", f"CUDA toolkit {self.toolkit['version']} from pinned pip wheels in a private "
                                   f"folder ({self.toolkit_prefix}), instead of the system CUDA 12.6 ActQuant "
                                   "documents. PyTorch's own pip toolkit mixes nvcc 13.3 with 13.0 runtime "
