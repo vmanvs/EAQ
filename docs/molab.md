@@ -39,10 +39,15 @@ include Git metadata, so retain the SHA copied in step 1. Review logs before
 sharing them publicly. Google Drive is a suitable place to upload the ZIP
 manually for now; automatic Drive artifact transfer is a later step.
 
-If the notebook cannot find `scripts/cloud_preflight.py` and
-`requirements/preflight.txt`, preserve the error and the Molab notebook URL.
-That means the server did not expose the mirrored repository in the expected
-layout. If CUDA is unavailable, check the GPU toggle and restart the server.
+Molab's GitHub sync brings down only the notebook file, not the rest of the
+repository. When `scripts/cloud_preflight.py` is not next to the notebook, the
+notebook downloads `scripts/cloud_preflight.py`, `scripts/actquant_probe.py`,
+and `requirements/preflight.txt` from `vmanvs/EAQ` through the GitHub API.
+It first resolves the branch to a commit, then records that commit as the
+run's `eaq_commit`. Set `EAQ_GIT_REF` (default `main`) or `EAQ_GITHUB_REPO`
+in Molab Secrets to change the source. A private repository also needs a
+read-only `GITHUB_TOKEN`. The repository line in the inventory shows where the
+scripts came from, or why fetching failed. If CUDA is unavailable, check the GPU toggle and restart the server.
 For attention, EGL, or Hugging Face failures, preserve the report and log so
 the runtime or access issue can be diagnosed before downloading large weights.
 

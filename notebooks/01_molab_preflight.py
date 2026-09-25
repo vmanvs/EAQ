@@ -79,7 +79,7 @@ def _(mo):
 
 
 @app.cell
-def _(Path, mo, subprocess):
+def _(Path, mo, os, subprocess):
     def locate_repository():
         starts = []
         try:
@@ -107,9 +107,57 @@ def _(Path, mo, subprocess):
                     return candidate, script, requirements
         return None, None, None
 
+    def fetch_repository(repo, ref):
+        """Download the preflight files at one resolved commit when Molab syncs only the notebook."""
+        import json as _json
+        import tempfile as _tempfile
+        import urllib.error as _urlerror
+        import urllib.request as _urlrequest
+
+        token = os.environ.get("GITHUB_TOKEN")
+        headers = {"User-Agent": "eaq-molab-preflight", "X-GitHub-Api-Version": "2022-11-28"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        def get(url, accept):
+            request = _urlrequest.Request(url, headers={**headers, "Accept": accept})
+            with _urlrequest.urlopen(request, timeout=30) as response:
+                return response.read()
+
+        try:
+            commit = _json.loads(get(f"https://api.github.com/repos/{repo}/commits/{ref}",
+                                     "application/vnd.github+json"))["sha"]
+            root = Path(_tempfile.gettempdir()) / "eaq-repo" / commit
+            for relative in FETCHED_FILES:
+                data = get(f"https://api.github.com/repos/{repo}/contents/{relative}?ref={commit}",
+                           "application/vnd.github.raw")
+                (root / relative).parent.mkdir(parents=True, exist_ok=True)
+                (root / relative).write_bytes(data)
+        except _urlerror.HTTPError as exc:
+            # Never include headers or the token; the status code is enough to diagnose.
+            hint = (" The repository is private: add a read-only GITHUB_TOKEN to Molab Secrets."
+                    if exc.code == 404 and not token else "")
+            return None, None, f"GitHub HTTP {exc.code} fetching {repo}@{ref}.{hint}"
+        except (_urlerror.URLError, OSError, KeyError, ValueError) as exc:
+            return None, None, f"Could not fetch {repo}@{ref}: {type(exc).__name__}"
+        return root, commit, None
+
+    FETCHED_FILES = ("scripts/cloud_preflight.py", "scripts/actquant_probe.py", "requirements/preflight.txt")
     repository_root, preflight_script, requirements_file = locate_repository()
+    repository_source = "local checkout" if repository_root is not None else None
+    fetch_error = None
     eaq_commit = "unknown"
-    if repository_root is not None:
+    if repository_root is None:
+        github_repo = os.environ.get("EAQ_GITHUB_REPO", "vmanvs/EAQ")
+        github_ref = os.environ.get("EAQ_GIT_REF", "main")
+        fetched_root, fetched_commit, fetch_error = fetch_repository(github_repo, github_ref)
+        if fetched_root is not None:
+            repository_root = fetched_root
+            preflight_script = fetched_root / "scripts" / "cloud_preflight.py"
+            requirements_file = fetched_root / "requirements" / "preflight.txt"
+            eaq_commit = fetched_commit
+            repository_source = f"GitHub API: {github_repo}@{github_ref} → {fetched_commit[:12]}"
+    elif repository_root is not None:
         try:
             git_root_result = subprocess.run(
                 ["git", "rev-parse", "--show-toplevel"],
@@ -137,8 +185,10 @@ def _(Path, mo, subprocess):
 
     return (
         eaq_commit,
+        fetch_error,
         preflight_script,
         repository_root,
+        repository_source,
         requirements_file,
     )
 
@@ -147,11 +197,13 @@ def _(Path, mo, subprocess):
 def _(
     Path,
     eaq_commit,
+    fetch_error,
     importlib,
     importlib_metadata,
     mo,
     platform,
     repository_root,
+    repository_source,
     requirements_file,
     shutil,
     subprocess,
@@ -191,8 +243,11 @@ def _(
     disk_anchor = repository_root or Path(tempfile.gettempdir())
     try:
         disk = shutil.disk_usage(disk_anchor)
+        free_text = f"{disk.free / 2**30:.2f} GiB free"
+        if disk.total > 2**50:
+            free_text = "size not measurable (sandbox reports an implausible filesystem size)"
         scratch_state = (
-            f"{disk.free / 2**30:.2f} GiB free at `{disk_anchor}`; "
+            f"{free_text} at `{disk_anchor}`; "
             f"run folders will be placed under `{scratch_parent}`"
         )
     except OSError as exc:
@@ -246,38 +301,38 @@ def _(
         pass
 
     repository_state = (
-        f"`{repository_root}`" if repository_root is not None else "not found"
+        f"`{repository_root}` ({repository_source})"
+        if repository_root is not None
+        else f"not found — {fetch_error or 'no fetch attempted'}"
     )
     requirements_state = (
         f"`{requirements_file}`" if requirements_file is not None else "not found"
     )
-    package_rows = "\n".join(
-        f"| `{name}` | `{version}` |" for name, version in packages.items()
-    )
-    mo.md(
-        f"""
-        ## Runtime and repository
-
-        - Python: `{platform.python_version()}` on `{platform.platform()}`
-        - Current directory: `{Path.cwd()}`
-        - EAQ repository root: {repository_state}
-        - Preflight script: `{repository_root / 'scripts' / 'cloud_preflight.py' if repository_root else 'not found'}`
-        - Requirements file: {requirements_state}
-        - EAQ Git commit: `{eaq_commit if repository_root is not None else 'unknown'}`
-        - Scratch: {scratch_state}
-        - RAM: {memory_state}
-        - GPU: {gpu_state}
-        - NVIDIA driver: {driver_state}
-
-        ## Installed package versions
-
-        These are inspection results only; this notebook does not install packages.
-
-        | Package | Installed version |
-        | --- | --- |
-        {package_rows}
-        """
-    )
+    # Build from explicit lines: multi-line values inside an indented f-string
+    # break marimo's dedent and garble the table.
+    inventory_lines = [
+        "## Runtime and repository",
+        "",
+        f"- Python: `{platform.python_version()}` on `{platform.platform()}`",
+        f"- Current directory: `{Path.cwd()}`",
+        f"- EAQ repository root: {repository_state}",
+        f"- Preflight script: `{repository_root / 'scripts' / 'cloud_preflight.py' if repository_root else 'not found'}`",
+        f"- Requirements file: {requirements_state}",
+        f"- EAQ Git commit: `{eaq_commit if repository_root is not None else 'unknown'}`",
+        f"- Scratch: {scratch_state}",
+        f"- RAM: {memory_state}",
+        f"- GPU: {gpu_state}",
+        f"- NVIDIA driver: {driver_state}",
+        "",
+        "## Installed package versions",
+        "",
+        "These are inspection results only; this notebook does not install packages.",
+        "",
+        "| Package | Installed version |",
+        "| --- | --- |",
+        *(f"| `{name}` | `{version}` |" for name, version in packages.items()),
+    ]
+    mo.md("\n".join(inventory_lines))
     return
 
 
@@ -285,7 +340,7 @@ def _(
 def _(mo):
     run_preflight = mo.ui.run_button(
         label="Run bounded preflight",
-        kind="primary",
+        kind="success",
         tooltip="Runs scripts/cloud_preflight.py in a new scratch folder.",
     )
     run_preflight
@@ -297,11 +352,13 @@ def _(
     Path,
     datetime,
     eaq_commit,
+    fetch_error,
     json,
     mo,
     os,
     preflight_script,
     repository_root,
+    repository_source,
     run_preflight,
     subprocess,
     sys,
@@ -313,7 +370,8 @@ def _(
             run_result = {
                 "error": (
                     "Could not locate scripts/cloud_preflight.py and "
-                    "requirements/preflight.txt in the mirrored repository."
+                    "requirements/preflight.txt next to the notebook, and the "
+                    f"GitHub fallback failed: {fetch_error}"
                 )
             }
         else:
@@ -331,6 +389,7 @@ def _(
                 "run_id": run_id,
                 "started_utc": started_utc,
                 "eaq_commit": eaq_commit,
+                "repository_source": repository_source,
                 "python": sys.version.split()[0],
                 "preflight_script": str(preflight_script),
                 "requirements_file": str(

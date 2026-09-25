@@ -46,6 +46,7 @@ MODELS = {
 # ActQuant README: ~50 GB for build outputs and intermediate GGUFs, plus the
 # 7.5 GB Pi 0.5 base checkpoint and 2.4 GB released 3 bpw checkpoint.
 MIN_DISK_GIB = 60
+IMPLAUSIBLE_DISK_BYTES = 2**50  # 1 PiB
 MIN_CMAKE = (3, 18)  # ggml-cuda's cmake_minimum_required
 BLACKWELL_MIN_NVCC = (12, 8)
 DEFAULT_REAL_ARCHS = ("86", "89")  # device code in the fork's default CMAKE_CUDA_ARCHITECTURES
@@ -229,11 +230,21 @@ def disk_check(output_dir):
             continue
         seen.add(device)
         locations.append({"path": str(anchor), "free_gib": round(usage.free / 2**30, 2),
-                          "total_gib": round(usage.total / 2**30, 2), "writable": os.access(anchor, os.W_OK)})
-    best = max((item["free_gib"] for item in locations if item["writable"]), default=0)
-    blockers = [] if best >= MIN_DISK_GIB else [
-        f"Largest writable free space is {best:.1f} GiB; ActQuant's Pi 0.5 path needs about {MIN_DISK_GIB} GiB."]
-    return {"required_gib": MIN_DISK_GIB, "locations": locations, "blockers": blockers,
+                          "total_gib": round(usage.total / 2**30, 2), "writable": os.access(anchor, os.W_OK),
+                          # Sandboxes such as gVisor (Molab) report placeholder sizes of many PiB.
+                          "size_plausible": usage.total < IMPLAUSIBLE_DISK_BYTES})
+    measurable = [item for item in locations if item["writable"] and item["size_plausible"]]
+    best = max((item["free_gib"] for item in measurable), default=0)
+    blockers, adaptations = [], []
+    if best >= MIN_DISK_GIB:
+        pass
+    elif any(item["writable"] and not item["size_plausible"] for item in locations):
+        adaptations.append("Sandboxed filesystem reports a placeholder size; real scratch capacity is unknown. "
+                           "Watch free space and RAM while staging the first weights.")
+    else:
+        blockers.append(f"Largest writable free space is {best:.1f} GiB; ActQuant's Pi 0.5 path needs about "
+                        f"{MIN_DISK_GIB} GiB.")
+    return {"required_gib": MIN_DISK_GIB, "locations": locations, "blockers": blockers, "adaptations": adaptations,
             "note": "Free space is a snapshot on possibly ephemeral scratch storage."}
 
 
