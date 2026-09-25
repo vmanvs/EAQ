@@ -135,8 +135,12 @@ def _(Path, mo, os, subprocess):
                 (root / relative).write_bytes(data)
         except _urlerror.HTTPError as exc:
             # Never include headers or the token; the status code is enough to diagnose.
-            hint = (" The repository is private: add a read-only GITHUB_TOKEN to Molab Secrets."
-                    if exc.code == 404 and not token else "")
+            hint = ""
+            if exc.code == 404 and not token:
+                hint = " The repository is private: add a read-only GITHUB_TOKEN to Molab Secrets."
+            elif exc.code in (403, 429) and exc.headers.get("X-RateLimit-Remaining") == "0":
+                hint = (" GitHub's unauthenticated API limit (60/hour per IP) is used up: wait for the "
+                        "reset or add a read-only GITHUB_TOKEN to Molab Secrets (5,000/hour).")
             return None, None, f"GitHub HTTP {exc.code} fetching {repo}@{ref}.{hint}"
         except (_urlerror.URLError, OSError, KeyError, ValueError) as exc:
             return None, None, f"Could not fetch {repo}@{ref}: {type(exc).__name__}"
@@ -338,6 +342,99 @@ def _(
 
 @app.cell
 def _(mo):
+    install_headers = mo.ui.run_button(
+        label="Install CUDA build headers",
+        tooltip=(
+            "Installs the pinned nvidia-cuda-cccl into the environment that holds "
+            "PyTorch's CUDA toolkit (--no-deps; PyTorch is not touched)."
+        ),
+    )
+    mo.vstack([
+        mo.md(
+            "### Optional: CUDA build headers for the ActQuant checks\n\n"
+            "PyTorch installs `nvcc` into its own environment but not the CCCL "
+            "headers it needs, and Molab's Packages panel installs into a separate "
+            "overlay environment that `nvcc` cannot see. This button installs the "
+            "`nvidia-cuda-cccl` version pinned in `requirements/preflight.txt` "
+            "next to PyTorch's toolkit. Run it once per session before the "
+            "preflight; the result is recorded in the run manifest."
+        ),
+        install_headers,
+    ])
+    return (install_headers,)
+
+
+@app.cell
+def _(Path, importlib, install_headers, mo, requirements_file, shutil, subprocess):
+    header_install = None
+    if install_headers.value:
+        header_install = {"attempts": []}
+        _spec = None
+        if requirements_file is not None:
+            for _line in requirements_file.read_text(encoding="utf-8").splitlines():
+                if _line.strip().startswith("nvidia-cuda-cccl=="):
+                    _spec = _line.partition("#")[0].strip()
+        header_install["requested"] = _spec
+        try:
+            _site = Path(importlib.import_module("torch").__file__).resolve().parents[1]
+        except Exception as _exc:
+            _site = None
+            header_install["error"] = f"PyTorch not importable ({type(_exc).__name__})"
+        _nvccs = sorted(_site.glob("nvidia/cu*/bin/nvcc")) if _site is not None else []
+        if _spec is None:
+            header_install["error"] = "No nvidia-cuda-cccl pin found in requirements/preflight.txt."
+        elif not _nvccs:
+            header_install.setdefault("error", f"No pip CUDA toolkit (nvidia/cu*/bin/nvcc) next to PyTorch in {_site}.")
+        else:
+            _toolkit = _nvccs[-1].parent.parent
+            _target = _toolkit / "include" / "nv" / "target"
+            # site-packages -> lib/python3.X -> prefix; the owning interpreter is prefix/bin/python3.X.
+            _python = _site.parents[2] / "bin" / _site.parent.name
+            if not _python.is_file():
+                _python = _site.parents[2] / "bin" / "python3"
+            header_install.update(toolkit=str(_toolkit), interpreter=str(_python))
+            if _target.is_file():
+                header_install["note"] = "CCCL headers already present in the toolkit; nothing installed."
+            else:
+                _commands = []
+                if shutil.which("uv"):
+                    _commands.append(["uv", "pip", "install", "--python", str(_python), "--system",
+                                      "--break-system-packages", "--no-deps", _spec])
+                _commands.append([str(_python), "-m", "pip", "install", "--no-deps",
+                                  "--break-system-packages", _spec])
+                for _command in _commands:
+                    try:
+                        _result = subprocess.run(_command, capture_output=True, text=True, check=False,
+                                                 timeout=600)
+                        _attempt = {"command": _command, "returncode": _result.returncode,
+                                    "output": (_result.stdout + _result.stderr)[-1500:]}
+                    except (OSError, subprocess.SubprocessError) as _exc:
+                        _attempt = {"command": _command, "returncode": None,
+                                    "output": f"{type(_exc).__name__}: {_exc}"}
+                    header_install["attempts"].append(_attempt)
+                    if _attempt["returncode"] == 0 and _target.is_file():
+                        break
+            header_install["headers_present"] = _target.is_file()
+
+    if header_install is None:
+        _message = mo.md("")
+    elif header_install.get("headers_present"):
+        _message = mo.md(
+            f"**CUDA build headers present** in `{header_install['toolkit']}`. "
+            f"{header_install.get('note', '')}"
+        )
+    else:
+        _details = header_install.get("error") or "\n\n".join(
+            f"`{' '.join(_a['command'])}` → exit `{_a['returncode']}`\n\n```text\n{_a['output']}\n```"
+            for _a in header_install["attempts"]
+        )
+        _message = mo.md(f"**Header install did not succeed.**\n\n{_details}")
+    _message
+    return (header_install,)
+
+
+@app.cell
+def _(mo):
     run_preflight = mo.ui.run_button(
         label="Run bounded preflight",
         kind="success",
@@ -353,6 +450,7 @@ def _(
     datetime,
     eaq_commit,
     fetch_error,
+    header_install,
     json,
     mo,
     os,
@@ -390,6 +488,7 @@ def _(
                 "started_utc": started_utc,
                 "eaq_commit": eaq_commit,
                 "repository_source": repository_source,
+                "cuda_header_install": header_install,
                 "python": sys.version.split()[0],
                 "preflight_script": str(preflight_script),
                 "requirements_file": str(

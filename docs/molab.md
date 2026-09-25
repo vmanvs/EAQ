@@ -23,9 +23,10 @@ notebook is a marimo `.py` file; GitHub is the source of truth for its code.
    Molab that is typically `mujoco`, `cmake`, and `ninja`; reinstall them in
    each new session. The panel installs into an overlay environment
    (`/tmp/uv-venv`), not the base environment that holds PyTorch's CUDA
-   toolkit, so `nvidia-cuda-cccl` (CUDA headers PyTorch omits) must instead be
-   installed into the base interpreter; the ActQuant toolchain check prints the
-   exact command. Keep Molab's installed PyTorch; it also supplies the CUDA
+   toolkit. So do not install `nvidia-cuda-cccl` (CUDA headers PyTorch omits)
+   there; click **Install CUDA build headers** in the notebook instead, once
+   per session before the preflight. It installs the pinned version next to
+   PyTorch's toolkit with `--no-deps` and records the result in the manifest. Keep Molab's installed PyTorch; it also supplies the CUDA
    13 toolkit (`nvcc` under `site-packages/nvidia/cu13`) that the ActQuant
    checks use. Do not install LaWAM's full requirements yet.
 5. For the gated access checks, ensure the Hugging Face account has
