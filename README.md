@@ -22,18 +22,31 @@ allocations will be compared with a universal allocation across conditions.
 
 ## Status
 
-Early research development. Model and benchmark feasibility are being evaluated.
-A reproducible policy baseline and quantization results are not yet available.
+Early research development; no policy baseline or quantization results yet.
+
+The first feasibility target is the released Pi 0.5 pipeline from
+[ActQuant](https://github.com/arashakb/ActQuant) on LIBERO. ActQuant allocates
+precision by action sensitivity, which makes it the natural action-sensitive
+comparison and starting point for this study. World-action models such as
+[LaWAM](https://github.com/RLinf/LaWAM) remain a later target.
+
+As of 2026-09-25 the Molab environment check reports
+`ready_with_adaptations` for that pipeline: its CUDA code can be compiled for
+and run on Molab's Blackwell GPU, with recorded deviations from ActQuant's
+documented setup. The next milestone is building ActQuant there and running a
+single inference with its released 3-bit checkpoint, followed by a
+reference-precision LIBERO rollout.
 
 ## Cloud validation
 
-The first cloud run uses [the Molab preflight notebook](notebooks/01_molab_preflight.py)
-to check GPU execution, headless rendering, and model-resource access before
-downloading weights. It also probes whether the host can build and run
-[ActQuant](https://github.com/arashakb/ActQuant)'s Pi 0.5 pipeline. After pushing it to GitHub, follow the
-[Molab setup and run guide](docs/molab.md). This validates infrastructure; it
-does not run the policy or benchmark. The earlier
-[Kaggle preflight](docs/kaggle.md) remains available as an alternative.
+Experiments run on [Molab](https://molab.marimo.io/), marimo's hosted notebook
+service. [The Molab preflight notebook](notebooks/01_molab_preflight.py) checks
+GPU execution, headless rendering, model access, and whether ActQuant's
+pipeline can be built, before any large download. See the
+[Molab guide](docs/molab.md) for running it, the observed environment, and the
+resulting build recipe. It validates infrastructure only; it does not run a
+policy or benchmark. The earlier [Kaggle preflight](docs/kaggle.md) remains
+available as an alternative.
 
 ## Experimental approach
 
