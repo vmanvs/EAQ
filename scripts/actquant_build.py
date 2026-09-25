@@ -1,0 +1,708 @@
+"""Build ActQuant's Pi 0.5 runtime on a Linux GPU host and run one inference.
+
+Applies the Molab build recipe established by `cloud_preflight.py --only
+actquant`: PyTorch's pip CUDA toolkit, CCCL headers installed next to it,
+device code for the attached GPU only, unversioned library links and a
+toolkit RPATH. Stages run in order and each writes `report.json`, so a
+partial run still leaves evidence:
+
+  headers    install nvidia-cuda-cccl next to PyTorch's nvcc, if missing
+  source     fetch ActQuant at its pinned commit and unpack vendored code
+  configure  CMake + Ninja configure of the pi05 runtime
+  build      build pi05, llama-quantize and, when possible, the pi05.so binding
+  download   fetch the pinned 3-bit checkpoint and verify its SHA-256
+  infer      one CUDA inference through the CLI (and the binding, if built)
+
+The work directory keeps sources, build trees and checkpoints between runs in
+one session, so stages can be rerun individually and builds are incremental.
+This is one self-contained file: Molab fetches it alone and may run Python
+with PYTHONSAFEPATH, which blocks sibling-module imports.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime as dt
+import glob
+import hashlib
+import importlib.metadata
+import importlib.util
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import site
+import subprocess
+import sys
+import sysconfig
+import tempfile
+import threading
+import time
+import zipfile
+
+
+ACTQUANT_URL = "https://github.com/arashakb/ActQuant"
+ACTQUANT_COMMIT = "b64791125070652fe6b554e244fe809c79ef5246"
+CHECKPOINT_REPO = "NU-World-Model-Embodied-AI/ActQuant-Pi05-LIBERO-3bpw"
+CHECKPOINT_REVISION = "4d03f36f1ac019ad5e314dea584697ab29644171"
+# SHA-256 of the LFS files at CHECKPOINT_REVISION; None = small file, not LFS-tracked.
+CHECKPOINT_FILES = {
+    "pi05.gguf": "7061b410272bbd35ad75e5919140fc55d2c5ed158f7f2c1ab45311ff39e54555",
+    "tokenizer.model": "8986bb4f423f07f8c7f70d0dbe3526fb2316056c17bae71b1ea975e77a168fc6",
+    "norm_stats.json": None,
+}
+CCCL_FALLBACK_SPEC = "nvidia-cuda-cccl==13.3.3.4.1"
+BUILD_TARGETS = ("pi05", "llama-quantize")
+DEFAULT_PROMPT = "put the black bowl on the plate"
+STAGES = ("headers", "source", "configure", "build", "download", "infer")
+TIMEOUTS = {"configure": 15 * 60, "build": 3 * 60 * 60, "infer": 20 * 60}
+
+
+class StageError(RuntimeError):
+    """A stage failed; the message is shown to the user, details stay in the report."""
+
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = details or {}
+
+
+def log(message):
+    print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def _run(command, timeout=60, cwd=None, env=None):
+    try:
+        result = subprocess.run([str(part) for part in command], capture_output=True, text=True,
+                                errors="replace", check=False, timeout=timeout, cwd=cwd, env=env)
+    except FileNotFoundError:
+        return {"returncode": None, "output": "not found"}
+    except OSError as exc:
+        return {"returncode": None, "output": f"could not start: {type(exc).__name__}: {exc}"}
+    except subprocess.TimeoutExpired:
+        return {"returncode": None, "output": f"timed out after {timeout} s"}
+    return {"returncode": result.returncode, "output": (result.stdout + result.stderr).strip()}
+
+
+def _stream(command, log_path, timeout, cwd=None, env=None, echo=True):
+    """Run a long command, appending its output to log_path and echoing it for the notebook."""
+    command = [str(part) for part in command]
+    started = time.monotonic()
+    tail = collections.deque(maxlen=80)
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        log_file.write(f"$ {' '.join(command)}\n")
+        log_file.flush()
+        try:
+            process = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True, errors="replace", bufsize=1)
+        except OSError as exc:
+            return {"returncode": None, "seconds": 0.0, "timed_out": False,
+                    "tail": f"could not start: {type(exc).__name__}: {exc}"}
+
+        def pump():
+            for line in process.stdout:
+                log_file.write(line)
+                tail.append(line.rstrip("\n"))
+                if echo:
+                    print(line, end="", flush=True)
+
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        timed_out = False
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            process.wait()
+        reader.join(timeout=30)
+        log_file.flush()
+    return {"returncode": process.returncode, "seconds": round(time.monotonic() - started, 1),
+            "timed_out": timed_out, "tail": "\n".join(tail)}
+
+
+def _version_tuple(text):
+    match = re.search(r"(\d+)\.(\d+)", text or "")
+    return (int(match[1]), int(match[2])) if match else None
+
+
+def _package_version(name):
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _site_dirs():
+    dirs = {sysconfig.get_paths()["purelib"], sysconfig.get_paths()["platlib"]}
+    try:
+        dirs.update(site.getsitepackages())
+    except AttributeError:
+        pass
+    # Molab layers a package venv (/tmp/uv-venv) over the base interpreter; sys.path sees both.
+    dirs.update(entry for entry in sys.path if entry.endswith(("site-packages", "dist-packages")))
+    return sorted(dirs)
+
+
+def _which(name):
+    """Find a tool on PATH or beside this interpreter, where pip puts cmake/ninja entry points."""
+    return shutil.which(name) or shutil.which(name, path=os.pathsep.join(
+        {str(Path(sys.executable).parent), sysconfig.get_paths()["scripts"]}))
+
+
+def find_toolkit():
+    """Prefer the pip CUDA toolkit next to PyTorch, as the preflight recipe does; else a system nvcc."""
+    candidates = []
+    spec = importlib.util.find_spec("torch")
+    if spec is not None and spec.origin:
+        torch_site = Path(spec.origin).resolve().parents[1]
+        candidates += sorted(torch_site.glob("nvidia/cu*/bin/nvcc"), reverse=True)
+    for directory in _site_dirs():
+        candidates += sorted(Path(directory).glob("nvidia/cu*/bin/nvcc"), reverse=True)
+    for name in filter(None, [shutil.which("nvcc"), *sorted(glob.glob("/usr/local/cuda*/bin/nvcc"))]):
+        candidates.append(Path(name))
+    for nvcc in candidates:
+        if not nvcc.is_file():
+            continue
+        result = _run([nvcc, "--version"], timeout=30)
+        match = re.search(r"release (\d+\.\d+)", result["output"])
+        root = nvcc.resolve().parent.parent
+        site_packages = next((parent for parent in root.parents
+                              if parent.name in ("site-packages", "dist-packages")), None)
+        interpreter = None
+        if site_packages is not None:  # .../lib/python3.X/site-packages -> .../bin/python3.X
+            for name in (site_packages.parent.name, "python3"):
+                candidate = site_packages.parents[2] / "bin" / name
+                if candidate.is_file():
+                    interpreter = str(candidate)
+                    break
+        return {"nvcc": str(nvcc), "version": match[1] if match else None, "root": str(root),
+                "source": "pip wheel" if site_packages is not None else "system",
+                "interpreter": interpreter}
+    return None
+
+
+def gpu_info():
+    result = _run(["nvidia-smi", "--query-gpu=name,compute_cap,driver_version,memory.total",
+                   "--format=csv,noheader"], timeout=30)
+    if result["returncode"] != 0 or not result["output"]:
+        return None
+    name, capability, driver, memory = [part.strip() for part in result["output"].splitlines()[0].split(",")]
+    cuda = re.search(r"CUDA Version:\s*(\d+\.\d+)", _run(["nvidia-smi"], timeout=30)["output"])
+    return {"name": name, "compute_capability": capability, "driver": driver, "memory": memory,
+            "driver_cuda": cuda[1] if cuda else None}
+
+
+def _find_libcuda():
+    """The driver library, which lives outside the toolkit; CMake's CUDA::cuda_driver needs libcuda.so."""
+    result = _run(["ldconfig", "-p"], timeout=30)
+    for line in result["output"].splitlines():
+        if "libcuda.so.1 " in line and "=>" in line:
+            return line.split("=>")[-1].strip()
+    for pattern in ("/usr/lib/x86_64-linux-gnu/libcuda.so.1", "/usr/lib64/libcuda.so.1",
+                    "/usr/local/nvidia/lib64/libcuda.so.1", "/usr/lib/wsl/lib/libcuda.so.1"):
+        if Path(pattern).exists():
+            return pattern
+    return None
+
+
+def _library_shim(toolkit_root, shim_dir):
+    """Link lib*.so -> lib*.so.N: pip toolkits ship only versioned sonames, which the linker ignores."""
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    linked = []
+    for library in sorted(Path(toolkit_root, "lib").glob("lib*.so.*")):
+        unversioned = library.name.split(".so.")[0] + ".so"
+        if not (library.parent / unversioned).exists() and not (shim_dir / unversioned).exists():
+            (shim_dir / unversioned).symlink_to(library)
+            linked.append(unversioned)
+    libcuda = _find_libcuda()
+    if libcuda and not (Path(libcuda).parent / "libcuda.so").exists() and not (shim_dir / "libcuda.so").exists():
+        (shim_dir / "libcuda.so").symlink_to(libcuda)
+        linked.append(f"libcuda.so -> {libcuda}")
+    return linked, libcuda
+
+
+def _cccl_spec(requirements):
+    if requirements and Path(requirements).is_file():
+        for line in Path(requirements).read_text(encoding="utf-8").splitlines():
+            requirement = line.partition("#")[0].strip()
+            if requirement.startswith("nvidia-cuda-cccl=="):
+                return requirement
+    return CCCL_FALLBACK_SPEC
+
+
+class Builder:
+    def __init__(self, args):
+        self.args = args
+        self.work = Path(args.work_dir).resolve()
+        self.output = Path(args.output).resolve()
+        self.source = self.work / "ActQuant"
+        self.checkpoint = self.work / "checkpoints" / "actquant-pi05-libero-3bpw"
+        self.toolkit = find_toolkit()
+        self.gpu = gpu_info()
+        capability = (self.gpu or {}).get("compute_capability") or ""
+        self.arch = args.cuda_arch or capability.replace(".", "") or None
+        suffix = f"sm{self.arch}" + ("-novmm" if args.no_vmm else "")
+        self.build_dir = self.work / f"build-{suffix}"
+        self.shim_dir = self.work / f"libshim-{suffix}"
+        self.deviations = {}
+        self.report = {
+            "schema_version": 1,
+            "scope": "ActQuant Pi 0.5 build and a single-inference smoke test; no LIBERO rollout",
+            "started_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "actquant": {"url": ACTQUANT_URL, "commit": ACTQUANT_COMMIT},
+            "checkpoint": {"repo": CHECKPOINT_REPO, "revision": CHECKPOINT_REVISION},
+            "options": {"stages": args.stages, "cuda_arch": self.arch, "no_vmm": args.no_vmm,
+                        "jobs": args.jobs, "cpu_check": args.cpu_check, "prompt": args.prompt,
+                        "work_dir": str(self.work), "build_dir": str(self.build_dir)},
+            "host": self._host(),
+            "toolkit": self.toolkit,
+            "stages": {},
+        }
+
+    def _host(self):
+        memory = None
+        try:
+            with open("/proc/meminfo", encoding="utf-8") as handle:
+                fields = dict(line.split(":", 1) for line in handle if ":" in line)
+            memory = {key: round(int(fields[key].split()[0]) / 2**20, 1) for key in ("MemTotal", "MemAvailable")}
+        except (OSError, KeyError, ValueError):
+            pass
+        try:
+            usage = shutil.disk_usage(self.work.parent if not self.work.exists() else self.work)
+            disk = {"free_gib": round(usage.free / 2**30, 1), "total_gib": round(usage.total / 2**30, 1)}
+            if usage.total > 2**50:
+                disk["note"] = "sandbox reports an implausible filesystem size; free space is not measurable"
+        except OSError:
+            disk = None
+        try:
+            cpus = len(os.sched_getaffinity(0))
+        except AttributeError:
+            cpus = os.cpu_count()
+        return {"python": sys.version.split()[0], "executable": sys.executable,
+                "platform": platform.platform(), "cpus": cpus, "memory_gib": memory, "disk": disk,
+                "gpu": self.gpu, "tools": {name: self._tool_version(name) for name in ("cmake", "ninja", "gcc", "git")},
+                "packages": {name: _package_version(name) for name in (
+                    "torch", "nvidia-cuda-cccl", "pybind11", "huggingface_hub", "cmake", "ninja")}}
+
+    @staticmethod
+    def _tool_version(name):
+        path = _which(name)
+        if not path:
+            return None
+        lines = _run([path, "--version"], timeout=30)["output"].splitlines()
+        return lines[0] if lines else path
+
+    # ------------------------------------------------------------------ report
+
+    def deviation(self, key, text):
+        self.deviations[key] = text
+
+    def save(self):
+        self.report["deviations"] = list(self.deviations.values())
+        self.report["finished_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        (self.output / "report.json").write_text(json.dumps(self.report, indent=2) + "\n", encoding="utf-8")
+
+    def run(self):
+        self.output.mkdir(parents=True, exist_ok=True)
+        self.work.mkdir(parents=True, exist_ok=True)
+        requested = [stage for stage in STAGES if stage in self.args.stages]
+        failed = None
+        for stage in requested:
+            if failed:
+                self.report["stages"][stage] = {"status": "skipped", "reason": f"stage '{failed}' failed"}
+                continue
+            log(f"=== stage: {stage} ===")
+            started = time.monotonic()
+            try:
+                details = getattr(self, f"stage_{stage}")() or {}
+                entry = {"status": "passed", **details}
+            except StageError as exc:
+                failed = stage
+                entry = {"status": "failed", "error": str(exc), **exc.details}
+                log(f"stage {stage} FAILED: {exc}")
+            except Exception as exc:  # keep the report even for unexpected errors
+                failed = stage
+                entry = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+                log(f"stage {stage} FAILED unexpectedly: {type(exc).__name__}: {exc}")
+            entry["seconds"] = round(time.monotonic() - started, 1)
+            self.report["stages"][stage] = entry
+            self.save()
+        if failed:
+            self.report["status"] = "failed"
+            self.report["failed_stage"] = failed
+        elif "infer" in requested:
+            self.report["status"] = "inference_ok"
+        elif "build" in requested:
+            self.report["status"] = "built"
+        else:
+            self.report["status"] = "stages_passed"
+        self.save()
+        log(f"status: {self.report['status']}")
+        return 0 if not failed else 1
+
+    # ------------------------------------------------------------------ stages
+
+    def _require_toolkit(self):
+        if self.toolkit is None:
+            raise StageError("No nvcc found (neither PyTorch's pip toolkit nor a system CUDA toolkit).")
+        return self.toolkit
+
+    def stage_headers(self):
+        toolkit = self._require_toolkit()
+        target = Path(toolkit["root"]) / "include" / "nv" / "target"
+        spec = _cccl_spec(self.args.requirements)
+        details = {"requested": spec, "toolkit": toolkit["root"], "interpreter": toolkit["interpreter"]}
+        cccl_version = _version_tuple(spec.split("==")[-1])
+        if cccl_version and _version_tuple(toolkit["version"]) != cccl_version:
+            details["warning"] = (f"CCCL pin {spec} does not match nvcc {toolkit['version']}; "
+                                  "update the pin in requirements/actquant-build.txt.")
+        if toolkit["source"] == "pip wheel":
+            self.deviation("cccl", f"CCCL headers from the pip wheel {spec}, installed with --no-deps next "
+                                   "to PyTorch's toolkit.")
+        if target.is_file():
+            return {**details, "note": "CCCL headers already present; nothing installed."}
+        if toolkit["interpreter"] is None:
+            raise StageError("CCCL headers are missing and the toolkit's owning interpreter is unknown.", details)
+        commands = []
+        if _which("uv"):
+            commands.append([_which("uv"), "pip", "install", "--python", toolkit["interpreter"], "--system",
+                             "--break-system-packages", "--no-deps", spec])
+        commands.append([toolkit["interpreter"], "-m", "pip", "install", "--no-deps",
+                         "--break-system-packages", spec])
+        attempts = []
+        for command in commands:
+            result = _run(command, timeout=600)
+            attempts.append({"command": command, "returncode": result["returncode"],
+                             "output": result["output"][-1500:]})
+            if result["returncode"] == 0 and target.is_file():
+                break
+        details["attempts"] = attempts
+        if not target.is_file():
+            raise StageError(f"Could not install CCCL headers into {toolkit['root']}.", details)
+        return details
+
+    def stage_source(self):
+        git = _which("git")
+        if not git:
+            raise StageError("git is not installed.")
+        self.source.mkdir(parents=True, exist_ok=True)
+        if not (self.source / ".git").is_dir():
+            _run([git, "init", "-q", self.source])
+            _run([git, "-C", self.source, "remote", "add", "origin", ACTQUANT_URL])
+        head = _run([git, "-C", self.source, "rev-parse", "HEAD"])["output"].strip()
+        if head != ACTQUANT_COMMIT:
+            log(f"fetching {ACTQUANT_URL} @ {ACTQUANT_COMMIT[:12]}")
+            fetch = _run([git, "-C", self.source, "fetch", "--depth", "1", "origin", ACTQUANT_COMMIT], timeout=900)
+            if fetch["returncode"] != 0:
+                raise StageError("git fetch of the pinned ActQuant commit failed.",
+                                 {"output": fetch["output"][-2000:]})
+            checkout = _run([git, "-C", self.source, "checkout", "-q", "--detach", "FETCH_HEAD"], timeout=300)
+            if checkout["returncode"] != 0:
+                raise StageError("git checkout failed.", {"output": checkout["output"][-2000:]})
+        head = _run([git, "-C", self.source, "rev-parse", "HEAD"])["output"].strip()
+        if head != ACTQUANT_COMMIT:
+            raise StageError(f"Checked-out commit {head} is not the pinned {ACTQUANT_COMMIT}.")
+        dirty = _run([git, "-C", self.source, "status", "--porcelain", "--untracked-files=no"])["output"]
+        vendored = self.source / "vendor" / "tokenizers-cpp"
+        if not vendored.is_dir():
+            # As in ActQuant's README: unzip vendor/tokenizers-cpp.zip -d vendor/
+            with zipfile.ZipFile(self.source / "vendor" / "tokenizers-cpp.zip") as archive:
+                archive.extractall(self.source / "vendor")
+        return {"commit": head, "path": str(self.source), "modified_tracked_files": dirty.splitlines(),
+                "tokenizers_cpp": vendored.is_dir()}
+
+    def _binding_plan(self):
+        """Build pi05.so only if this interpreter can: pybind11 importable and Python.h present."""
+        include = Path(sysconfig.get_paths()["include"])
+        reasons = []
+        if importlib.util.find_spec("pybind11") is None:
+            reasons.append("pybind11 is not installed (install it from the Packages panel)")
+        if not (include / "Python.h").is_file():
+            reasons.append(f"Python.h not found in {include}")
+        return (not reasons and not self.args.no_binding), reasons
+
+    def stage_configure(self):
+        toolkit = self._require_toolkit()
+        cmake, ninja = _which("cmake"), _which("ninja")
+        if not cmake:
+            raise StageError("cmake is not installed; install the pin from requirements/actquant-build.txt.")
+        if not (self.source / "CMakeLists.txt").is_file():
+            raise StageError("ActQuant sources are missing; run the source stage.")
+        if not self.arch:
+            raise StageError("No GPU compute capability found; attach a GPU or pass --cuda-arch.")
+        if not (Path(toolkit["root"]) / "include" / "nv" / "target").is_file():
+            raise StageError("CCCL headers are missing from the toolkit; run the headers stage.")
+        linked, libcuda = _library_shim(toolkit["root"], self.shim_dir)
+        binding, binding_reasons = self._binding_plan()
+        base = [cmake, "-S", self.source, "-B", self.build_dir,
+                *(["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"] if ninja else ["-G", "Unix Makefiles"]),
+                "-DCMAKE_BUILD_TYPE=Release", "-DGGML_CUDA=ON",
+                f"-DCMAKE_CUDA_COMPILER={toolkit['nvcc']}", f"-DCUDAToolkit_ROOT={toolkit['root']}",
+                f"-DCMAKE_CUDA_ARCHITECTURES={self.arch}",
+                f"-DCMAKE_LIBRARY_PATH={self.shim_dir}",
+                f"-DCMAKE_BUILD_RPATH={Path(toolkit['root']) / 'lib'}",
+                "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+                "-DLLAMA_CURL=OFF",
+                f"-DPython_EXECUTABLE={sys.executable}",
+                *(["-DGGML_CUDA_NO_VMM=ON"] if self.args.no_vmm else [])]
+        log_path = self.output / "configure.log"
+        attempts = []
+        result = _stream([*base, f"-DBUILD_PI05_PYTHON={'ON' if binding else 'OFF'}"], log_path,
+                         TIMEOUTS["configure"])
+        attempts.append({"binding": binding, "returncode": result["returncode"], "seconds": result["seconds"]})
+        if result["returncode"] != 0 and binding:
+            log("configure failed with the Python binding enabled; retrying without it")
+            binding_reasons.append("CMake could not configure the binding (see configure.log)")
+            binding = False
+            result = _stream([*base, "-DBUILD_PI05_PYTHON=OFF"], log_path, TIMEOUTS["configure"])
+            attempts.append({"binding": False, "returncode": result["returncode"], "seconds": result["seconds"]})
+        details = {"attempts": attempts, "library_links": linked, "libcuda": libcuda,
+                   "binding": binding, "binding_skipped_because": binding_reasons, "generator":
+                   "Ninja" if ninja else "Unix Makefiles"}
+        if result["returncode"] != 0:
+            raise StageError("CMake configure failed; see configure.log.", {**details, "tail": result["tail"]})
+        architectures = re.findall(r"Using CUDA architectures: (.*)", log_path.read_text(encoding="utf-8"))
+        details["cuda_architectures_reported"] = architectures[-1] if architectures else None
+        self.report["binding"] = {"enabled": binding, "skipped_because": binding_reasons}
+        self.deviation("toolkit", f"CUDA toolkit: {toolkit['source']} nvcc {toolkit['version']} at "
+                                  f"{toolkit['root']} (ActQuant documents CUDA 12.6 for Pi 0.5).")
+        self.deviation("arch", f"CMAKE_CUDA_ARCHITECTURES={self.arch}: device code for this GPU only "
+                               "(ActQuant's README leaves it to ggml's default).")
+        self.deviation("libs", "Unversioned library links in a scratch folder (CMAKE_LIBRARY_PATH) and "
+                               "CMAKE_BUILD_RPATH to the toolkit's lib folder.")
+        self.deviation("curl", "LLAMA_CURL=OFF: the runtime does not download models and libcurl "
+                               "headers are not assumed.")
+        if self.args.no_vmm:
+            self.deviation("vmm", "GGML_CUDA_NO_VMM=ON: CUDA virtual memory management disabled.")
+        self.deviation("binding", f"pi05.so built for Python {platform.python_version()} "
+                                  "(ActQuant's policy server uses Python 3.11)." if binding else
+                       "pi05.so not built: " + "; ".join(binding_reasons))
+        return details
+
+    def _jobs(self):
+        if self.args.jobs:
+            return self.args.jobs
+        cpus = self.report["host"]["cpus"] or 4
+        available = (self.report["host"]["memory_gib"] or {}).get("MemAvailable")
+        # CUDA template instances take about 2 GiB each to compile.
+        by_memory = int(available // 2.5) if available else cpus
+        return max(1, min(cpus, by_memory, 64))
+
+    def stage_build(self):
+        cmake = _which("cmake")
+        if not cmake or not (self.build_dir / "CMakeCache.txt").is_file():
+            raise StageError("No configured build tree; run the configure stage.")
+        cache = (self.build_dir / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace")
+        binding = "BUILD_PI05_PYTHON:BOOL=ON" in cache
+        targets = [*BUILD_TARGETS, *(["pi05_py"] if binding else [])]
+        jobs = self._jobs()
+        log(f"building {', '.join(targets)} with {jobs} parallel jobs; the first build takes a while")
+        result = _stream([cmake, "--build", self.build_dir, "--target", *targets, "-j", str(jobs)],
+                         self.output / "build.log", self.args.build_timeout)
+        details = {"targets": targets, "jobs": jobs, "returncode": result["returncode"],
+                   "build_seconds": result["seconds"]}
+        if result["timed_out"]:
+            raise StageError(f"Build timed out after {self.args.build_timeout} s; rerun to continue "
+                             "(the build is incremental).", {**details, "tail": result["tail"][-4000:]})
+        if result["returncode"] != 0:
+            errors = [line for line in result["tail"].splitlines() if "error" in line.lower()]
+            raise StageError("Build failed; see build.log.",
+                             {**details, "errors": errors[-20:], "tail": result["tail"][-4000:]})
+        binary_dir = self.build_dir / "bin"
+        details["outputs"] = {path.name: path.stat().st_size for path in sorted(binary_dir.iterdir())
+                              if path.is_file()} if binary_dir.is_dir() else {}
+        ldd = _run(["ldd", binary_dir / "pi05"], timeout=60)["output"]
+        details["pi05_libraries"] = [line.strip() for line in ldd.splitlines()
+                                     if re.search(r"cuda|cublas|ggml|llama|not found", line)]
+        if "not found" in ldd:
+            raise StageError("pi05 links against libraries the loader cannot find (see pi05_libraries).",
+                             details)
+        return details
+
+    def stage_download(self):
+        try:
+            from huggingface_hub import HfApi, hf_hub_download
+        except ImportError as exc:
+            raise StageError("huggingface_hub is not installed.") from exc
+        self.checkpoint.mkdir(parents=True, exist_ok=True)
+        token = os.environ.get("HF_TOKEN") or None  # not required: the checkpoint is public
+        files = {}
+        for name, expected in CHECKPOINT_FILES.items():
+            target = self.checkpoint / name
+            if not (target.is_file() and (expected is None or self._sha256(target) == expected)):
+                log(f"downloading {name}")
+                started = time.monotonic()
+                try:
+                    path = hf_hub_download(CHECKPOINT_REPO, name, revision=CHECKPOINT_REVISION, token=token,
+                                           local_dir=str(self.checkpoint))
+                except Exception as exc:  # never log tokens or raw HTTP exceptions
+                    code = getattr(getattr(exc, "response", None), "status_code", None)
+                    raise StageError(f"Download of {name} failed ({type(exc).__name__}, HTTP {code}).")
+                target = Path(path)
+                files[name] = {"download_seconds": round(time.monotonic() - started, 1)}
+            digest = self._sha256(target)
+            files.setdefault(name, {}).update(bytes=target.stat().st_size, sha256=digest)
+            if expected is not None and digest != expected:
+                raise StageError(f"{name} SHA-256 mismatch: expected {expected}, got {digest}.", {"files": files})
+        try:
+            resolved = HfApi().model_info(CHECKPOINT_REPO, revision=CHECKPOINT_REVISION, token=token).sha
+        except Exception:
+            resolved = None
+        return {"path": str(self.checkpoint), "files": files, "revision_resolved": resolved}
+
+    @staticmethod
+    def _sha256(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(16 * 2**20), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _smoke_image(self):
+        """A synthetic 224x224 RGB image: a gradient table with two coloured blocks. Written as binary PPM."""
+        path = self.output / "smoke_input.ppm"
+        width = height = 224
+        pixels = bytearray()
+        for y in range(height):
+            for x in range(width):
+                if 60 <= x < 110 and 120 <= y < 170:
+                    pixels += bytes((20, 20, 20))       # dark "bowl"
+                elif 140 <= x < 200 and 130 <= y < 180:
+                    pixels += bytes((200, 200, 210))    # light "plate"
+                else:
+                    pixels += bytes((120 + x // 4, 90 + y // 5, 60))
+        path.write_bytes(f"P6 {width} {height} 255\n".encode() + bytes(pixels))
+        return path
+
+    @staticmethod
+    def _parse_cli(output):
+        parsed = {}
+        match = re.search(r"Total inference time:\s*([\d.]+)\s*ms", output)
+        parsed["inference_ms"] = float(match[1]) if match else None
+        match = re.search(r"First timestep actions:\s*\n\s*\[([^\]]*)\]", output)
+        if match:
+            parsed["first_actions"] = [float(value) for value in re.findall(r"[-+]?(?:nan|inf|\d+\.?\d*(?:e[-+]?\d+)?)",
+                                                                             match[1], flags=re.I)]
+        matches = re.findall(r"min:\s*(\S+),\s*max:\s*(\S+),\s*mean:\s*(\S+)", output)
+        if matches:
+            parsed["stats"] = {key: float(value) for key, value in zip(("min", "max", "mean"), matches[-1])}
+        match = re.search(r"using (\S+) backend", output)
+        parsed["backend"] = match[1] if match else None
+        match = re.search(r"Output actions \((\d+) dim x (\d+) horizon", output)
+        if match:
+            parsed["action_dim"], parsed["action_horizon"] = int(match[1]), int(match[2])
+        parsed["completed"] = "Inference completed successfully." in output
+        return parsed
+
+    def _cli(self, device, image, label):
+        binary = self.build_dir / "bin" / "pi05"
+        threads = min(8, self.report["host"]["cpus"] or 4)
+        result = _stream([binary, "-m", self.checkpoint, "-i", image, "-p", self.args.prompt,
+                          "-d", device, "-n", str(threads), "-s", "10"],
+                         self.output / f"infer_{label}.log", TIMEOUTS["infer"])
+        text = (self.output / f"infer_{label}.log").read_text(encoding="utf-8", errors="replace")
+        return {"device": device, "returncode": result["returncode"], "seconds": result["seconds"],
+                "timed_out": result["timed_out"], **self._parse_cli(text)}
+
+    @staticmethod
+    def _finite(values):
+        return bool(values) and all(math.isfinite(value) for value in values)
+
+    def stage_infer(self):
+        binary = self.build_dir / "bin" / "pi05"
+        if not binary.is_file():
+            raise StageError(f"{binary} does not exist; run the build stage.")
+        missing = [name for name in CHECKPOINT_FILES if not (self.checkpoint / name).is_file()]
+        if missing:
+            raise StageError(f"Checkpoint files missing ({', '.join(missing)}); run the download stage.")
+        image = self._smoke_image()
+        self.deviation("smoke", "Smoke-test input is a synthetic 224x224 image and a fixed prompt, "
+                                "not a LIBERO observation; it checks execution, not task behaviour.")
+        details = {"image": image.name, "prompt": self.args.prompt}
+        cuda = self._cli("CUDA0", image, "cuda")
+        details["cli_cuda"] = cuda
+        problems = []
+        if cuda["returncode"] != 0 or not cuda["completed"]:
+            problems.append(f"pi05 CLI exited with {cuda['returncode']} (see infer_cuda.log)")
+        if cuda["backend"] != "CUDA0":
+            problems.append(f"pi05 ran on backend {cuda['backend']!r}, not CUDA0")
+        if not self._finite(cuda.get("first_actions", [])) or not self._finite(list(cuda.get("stats", {}).values())):
+            problems.append("actions missing or not finite")
+
+        binding_file = next(iter(sorted((self.build_dir / "bin").glob("pi05*.so"))), None)
+        if binding_file is not None and not problems:
+            details["binding"] = self._binding_run(binding_file, image)
+            if details["binding"].get("first") and cuda.get("first_actions"):
+                count = min(len(details["binding"]["first"]), len(cuda["first_actions"]))
+                details["binding_vs_cli_max_abs_diff"] = max(
+                    abs(a - b) for a, b in zip(details["binding"]["first"][:count], cuda["first_actions"][:count]))
+        elif binding_file is None:
+            details["binding"] = {"status": "not built"}
+
+        if self.args.cpu_check and not problems:
+            cpu = self._cli("CPU", image, "cpu")
+            details["cli_cpu"] = cpu
+            if cpu.get("first_actions") and cuda.get("first_actions"):
+                count = min(len(cpu["first_actions"]), len(cuda["first_actions"]))
+                details["cpu_vs_cuda_max_abs_diff"] = max(
+                    abs(a - b) for a, b in zip(cpu["first_actions"][:count], cuda["first_actions"][:count]))
+        if problems:
+            raise StageError("; ".join(problems), details)
+        return details
+
+    def _binding_run(self, binding_file, image):
+        """Load pi05.so in a fresh interpreter: the path serve_policy.py uses. Two runs give warm latency."""
+        code = f"""
+import json, sys, time
+sys.path.insert(0, {str(binding_file.parent)!r})
+import pi05
+t = time.monotonic()
+pipeline = pi05.Pi05Pipeline(model_path={str(self.checkpoint / 'pi05.gguf')!r},
+                             tokenizer_path={str(self.checkpoint / 'tokenizer.model')!r},
+                             device_name="CUDA0", n_threads=4, num_flow_steps=10)
+load = time.monotonic() - t
+runs, times = [], []
+for _ in range(2):
+    t = time.monotonic()
+    runs.append([float(v) for v in pipeline.run({str(image)!r}, {self.args.prompt!r})])
+    times.append(time.monotonic() - t)
+print("EAQ_BINDING " + json.dumps({{
+    "load_seconds": load, "run_seconds": times, "values": len(runs[0]),
+    "action_horizon": pipeline.action_horizon, "action_dim": pipeline.action_dim,
+    "first": runs[0][:pipeline.action_dim][:10],
+    "repeat_max_abs_diff": max(abs(a - b) for a, b in zip(runs[0], runs[1])),
+    "finite": all(v == v and abs(v) != float("inf") for v in runs[0])}}))
+"""
+        result = _stream([sys.executable, "-c", code], self.output / "infer_binding.log", TIMEOUTS["infer"])
+        text = (self.output / "infer_binding.log").read_text(encoding="utf-8", errors="replace")
+        match = re.search(r"^EAQ_BINDING (.*)$", text, flags=re.M)
+        if result["returncode"] != 0 or not match:
+            return {"status": "failed", "returncode": result["returncode"], "tail": result["tail"][-2000:]}
+        return {"status": "passed", "file": binding_file.name, **json.loads(match[1])}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--output", required=True, type=Path, help="Run folder for report.json and logs.")
+    parser.add_argument("--work-dir", type=Path,
+                        default=Path(os.environ.get("EAQ_WORK_DIR", Path(tempfile.gettempdir()) / "eaq-actquant")),
+                        help="Persistent folder for sources, build trees and checkpoints.")
+    parser.add_argument("--stages", nargs="+", choices=STAGES, default=list(STAGES))
+    parser.add_argument("--requirements", type=Path,
+                        default=Path(__file__).resolve().parents[1] / "requirements" / "actquant-build.txt")
+    parser.add_argument("--cuda-arch", help="Override the GPU architecture, e.g. 120.")
+    parser.add_argument("--jobs", type=int, help="Parallel build jobs (default: CPUs, limited by RAM).")
+    parser.add_argument("--no-vmm", action="store_true", help="Build with GGML_CUDA_NO_VMM=ON.")
+    parser.add_argument("--no-binding", action="store_true", help="Do not build the pi05.so Python binding.")
+    parser.add_argument("--cpu-check", action="store_true", help="Also run the CLI on CPU and compare.")
+    parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    parser.add_argument("--build-timeout", type=int, default=TIMEOUTS["build"])
+    args = parser.parse_args()
+    return Builder(args).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

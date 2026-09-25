@@ -108,7 +108,7 @@ Four behaviours shaped the recipe below:
 
 ## ActQuant build recipe for Molab
 
-Derived from the preflight; not yet applied to ActQuant itself.
+Derived from the preflight and applied by the build notebook below.
 
 1. Install `cmake` and `ninja` from the Packages panel and click **Install CUDA
    build headers**.
@@ -127,6 +127,44 @@ Open questions: whether ActQuant's own ggml kernels build and run under this
 setup, real scratch-disk capacity, and whether long policy-server rollouts fit
 Molab's [usage restrictions](https://molab.marimo.io/pages/molab/restrictions)
 and 12-hour session limit.
+
+## Building ActQuant
+
+`notebooks/02_actquant_build.py` applies the recipe to ActQuant itself. Like the
+preflight, it fetches its script (`scripts/actquant_build.py`) and pins
+(`requirements/actquant-build.txt`) through the GitHub API.
+
+1. Attach the GPU, open the **Server** preview, and install `cmake`, `ninja`,
+   `huggingface_hub`, and optionally `pybind11` from the Packages panel. Do
+   not install `nvidia-cuda-cccl` there; the `headers` stage installs it next
+   to PyTorch's `nvcc`.
+2. Choose stages and click **Run ActQuant build**. Output streams into the
+   notebook while it runs.
+3. Download the run artifacts before the session ends.
+
+| Stage | What it does |
+| --- | --- |
+| `headers` | Installs the pinned CCCL headers into PyTorch's toolkit if they are missing |
+| `source` | Fetches ActQuant at its pinned commit and unpacks `vendor/tokenizers-cpp.zip` |
+| `configure` | Runs CMake with the recipe's flags and `LLAMA_CURL=OFF`; enables the `pi05.so` binding when `pybind11` and `Python.h` are available, and retries without it otherwise |
+| `build` | Builds `pi05`, `llama-quantize` and, if enabled, `pi05.so`; checks with `ldd` that every library resolves |
+| `download` | Fetches `pi05.gguf`, `tokenizer.model` and `norm_stats.json` of `ActQuant-Pi05-LIBERO-3bpw` at a pinned revision and verifies SHA-256 |
+| `infer` | Runs the `pi05` CLI once on `CUDA0` with a synthetic image and a fixed prompt, and requires finite actions. If the binding was built, it also loads it and runs it twice, for warm latency and repeatability |
+
+Sources, build trees and the checkpoint stay in a work folder (`EAQ_WORK_DIR`,
+default `/tmp/eaq-actquant`) for the session. Stages can be rerun on their
+own, and an interrupted build resumes where it stopped. The run ZIP holds
+`report.json` (stage results, host and toolkit details, and the list of
+deviations from ActQuant's documented setup), `manifest.json`, and the
+configure, build and inference logs. Binaries and weights are not included.
+
+The **CPU comparison** option runs the CLI on the CPU as well. The flow's noise
+uses a fixed seed, so the two outputs should be close, though not identical.
+The **no-VMM** option builds a separate tree with `GGML_CUDA_NO_VMM=ON`, in
+case CUDA virtual memory management does not work under gVisor.
+
+The smoke test shows that the runtime executes and produces finite actions on
+this GPU. It is not a LIBERO observation and says nothing about task success.
 
 Molab documentation: [GitHub mirroring and server previews](https://docs.marimo.io/guides/molab/#mirror-notebooks-from-github),
 [GPU and session limits](https://docs.marimo.io/guides/molab/#compute), and

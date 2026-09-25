@@ -1,0 +1,11 @@
+# ActQuant build notebook (notebooks/02_actquant_build.py). Keep Molab's PyTorch:
+# its pip CUDA toolkit (site-packages/nvidia/cu13) is the compiler used for the build.
+# Install these from the Packages panel:
+cmake==4.4.3
+ninja==1.13.2
+huggingface_hub==0.34.4
+# Optional: builds the pi05.so Python binding that ActQuant's policy server loads.
+pybind11==3.1.0
+# Not from the Packages panel: the notebook's headers stage installs it with --no-deps
+# into PyTorch's interpreter, next to nvcc. Match nvcc if Molab's torch changes.
+nvidia-cuda-cccl==13.3.3.4.1
