@@ -1,0 +1,14 @@
+# Private CUDA 13.0 toolkit for the ActQuant build, installed by the build script with
+# --target into its work folder (never into PyTorch's environment).
+#
+# PyTorch 2.11 cu130 ships a mixed toolkit: nvcc 13.3 (pulled in by other packages)
+# with 13.0 runtime headers. CCCL refuses that mix ("CUDA compiler and CUDA toolkit
+# headers are incompatible"). Every package below is from the same 13.0 release;
+# runtime and cuBLAS match the versions PyTorch cu130 installs. All versions must
+# share one major.minor, and it must not be newer than the driver's CUDA version.
+nvidia-cuda-nvcc==13.0.88
+nvidia-cuda-crt==13.0.88
+nvidia-nvvm==13.0.88
+nvidia-cuda-cccl==13.0.85
+nvidia-cuda-runtime==13.0.96
+nvidia-cublas==13.1.0.3

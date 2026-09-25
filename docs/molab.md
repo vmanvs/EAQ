@@ -85,10 +85,10 @@ Observed on 2026-09-25 (EAQ commit `1ad08ef`); verdict
 | Driver | 595.71.05, supporting CUDA 13.2 |
 | Host | gVisor sandbox, Debian 13, glibc 2.41, 160 GiB RAM, root with apt |
 | Python | 3.13; PyTorch 2.11.0 built for CUDA 13.0 |
-| CUDA toolkit | No system toolkit. PyTorch's pip dependencies install nvcc 13.3 under `site-packages/nvidia/cu13` |
+| CUDA toolkit | No system toolkit. Pip packages install a mixed toolkit under `site-packages/nvidia/cu13`: nvcc 13.3 with the 13.0 runtime headers PyTorch pins |
 | Disk | Not measurable: the sandbox reports a placeholder size |
 
-Four behaviours shaped the recipe below:
+Five behaviours shaped the recipe below:
 
 - **Two Python environments.** The Packages panel installs into an overlay
   environment (`/tmp/uv-venv`), while PyTorch and its CUDA toolkit live in the
@@ -98,6 +98,12 @@ Four behaviours shaped the recipe below:
   `nvidia-cuda-cccl` next to PyTorch's toolkit instead, with `--no-deps`.
 - **Incomplete pip toolkit.** PyTorch pulls in nvcc but not the CCCL headers
   (`nv/target`, `include/cccl`) that `cuda_fp16.h` and CMake require.
+- **Mixed pip toolkit versions.** nvcc is 13.3 (`nvidia-cuda-nvcc`), but the
+  runtime headers are 13.0 (`nvidia-cuda-runtime`, pinned by PyTorch). Small
+  kernels compile, but CCCL's CUB refuses the mix ("CUDA compiler and CUDA
+  toolkit headers are incompatible"), which failed the first ActQuant build
+  in ggml's `mean.cu`. The build therefore uses its own toolkit, pinned to
+  one CUDA release.
 - **nvcc newer than the driver.** Code compiled for sm_120 runs, but the
   driver cannot JIT-compile PTX produced by the newer nvcc ("PTX was compiled
   with an unsupported toolchain"). Builds must include sm_120 device code.
@@ -108,11 +114,14 @@ Four behaviours shaped the recipe below:
 
 ## ActQuant build recipe for Molab
 
-Derived from the preflight and applied by the build notebook below.
+Derived from the preflight and the first build, and applied by the build
+notebook below.
 
-1. Install `cmake` and `ninja` from the Packages panel and click **Install CUDA
-   build headers**.
-2. Use PyTorch's toolkit, `TOOLKIT=/usr/local/lib/python3.13/site-packages/nvidia/cu13`.
+1. Install `cmake` and `ninja` from the Packages panel.
+2. Install the CUDA 13.0 wheels pinned in `requirements/actquant-cuda-toolkit.txt`
+   with `--target` into a private folder, and use
+   `TOOLKIT=<folder>/nvidia/cu13`. This leaves PyTorch's environment
+   untouched, and the toolkit is not newer than the driver (13.2).
 3. Create unversioned links for `$TOOLKIT/lib/lib*.so.*` in a scratch folder
    and pass it as `-DCMAKE_LIBRARY_PATH`.
 4. Configure with `-G Ninja -DCMAKE_CUDA_COMPILER=$TOOLKIT/bin/nvcc
@@ -124,7 +133,8 @@ Derived from the preflight and applied by the build notebook below.
    (Ubuntu 22.04, CUDA 12.6, conda).
 
 Open questions: whether ActQuant's own ggml kernels build and run under this
-setup, real scratch-disk capacity, and whether long policy-server rollouts fit
+setup (the first build reached 40 of 234 steps before the version mix
+stopped it), real scratch-disk capacity, and whether long policy-server rollouts fit
 Molab's [usage restrictions](https://molab.marimo.io/pages/molab/restrictions)
 and 12-hour session limit.
 
@@ -132,19 +142,19 @@ and 12-hour session limit.
 
 `notebooks/02_actquant_build.py` applies the recipe to ActQuant itself. Like the
 preflight, it fetches its script (`scripts/actquant_build.py`) and pins
-(`requirements/actquant-build.txt`) through the GitHub API.
+(`requirements/actquant-build.txt`, `requirements/actquant-cuda-toolkit.txt`)
+through the GitHub API.
 
 1. Attach the GPU, open the **Server** preview, and install `cmake`, `ninja`,
    `huggingface_hub`, and optionally `pybind11` from the Packages panel. Do
-   not install `nvidia-cuda-cccl` there; the `headers` stage installs it next
-   to PyTorch's `nvcc`.
+   not install CUDA packages; the `toolkit` stage installs its own.
 2. Choose stages and click **Run ActQuant build**. Output streams into the
    notebook while it runs.
 3. Download the run artifacts before the session ends.
 
 | Stage | What it does |
 | --- | --- |
-| `headers` | Installs the pinned CCCL headers into PyTorch's toolkit if they are missing |
+| `toolkit` | Installs the pinned CUDA 13.0 wheels (about 0.5 GB) into the work folder. It then checks that nvcc, the runtime headers and CCCL agree and that nvcc is not newer than the driver, and compiles a CUB + `cuda_fp16` kernel for the GPU |
 | `source` | Fetches ActQuant at its pinned commit and unpacks `vendor/tokenizers-cpp.zip` |
 | `configure` | Runs CMake with the recipe's flags and `LLAMA_CURL=OFF`; enables the `pi05.so` binding when `pybind11` and `Python.h` are available, and retries without it otherwise |
 | `build` | Builds `pi05`, `llama-quantize` and, if enabled, `pi05.so`; checks with `ldd` that every library resolves |

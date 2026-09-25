@@ -52,9 +52,11 @@ def _(mo):
         Builds [ActQuant](https://github.com/arashakb/ActQuant)'s Pi 0.5 runtime
         at its pinned commit for the attached GPU, downloads the released 3-bit
         checkpoint (`ActQuant-Pi05-LIBERO-3bpw`, about 2.4 GB), and runs **one**
-        inference on CUDA. It applies the recipe from the preflight notebook:
-        PyTorch's pip CUDA toolkit, CCCL headers installed next to it, device
-        code for this GPU only, unversioned library links and a toolkit RPATH.
+        inference on CUDA. It applies the recipe from the preflight notebook,
+        with one change: PyTorch's pip CUDA toolkit mixes nvcc 13.3 with 13.0
+        runtime headers, which CUB rejects, so the build uses its own pinned
+        CUDA 13.0 toolkit. Device code is built for this GPU only, with
+        unversioned library links and a toolkit RPATH.
         Every departure from ActQuant's documented setup is listed as a
         deviation in the report.
 
@@ -68,8 +70,9 @@ def _(mo):
         2. From the **Packages** panel install `cmake`, `ninja`,
            `huggingface_hub`, and optionally `pybind11` (for the `pi05.so`
            binding), pinned in `requirements/actquant-build.txt`.
-        3. The `headers` stage installs `nvidia-cuda-cccl` next to PyTorch's
-           `nvcc` by itself; do not install it from the Packages panel.
+        3. Do not install CUDA packages. The `toolkit` stage installs a pinned,
+           version-consistent CUDA 13.0 toolkit (about 0.5 GB of wheels) into
+           the work folder; PyTorch's environment is not touched.
 
         No token is needed: ActQuant and the checkpoint are public.
 
@@ -141,7 +144,11 @@ def _(Path, mo, os):
             return None, None, f"Could not fetch {repo}@{ref}: {type(exc).__name__}"
         return root, commit, None
 
-    FETCHED_FILES = ("scripts/actquant_build.py", "requirements/actquant-build.txt")
+    FETCHED_FILES = (
+        "scripts/actquant_build.py",
+        "requirements/actquant-build.txt",
+        "requirements/actquant-cuda-toolkit.txt",
+    )
     repository_root = locate_repository()
     fetch_error = None
     eaq_commit = "unknown (local checkout)"
@@ -156,6 +163,9 @@ def _(Path, mo, os):
             repository_source = f"GitHub API: {github_repo}@{github_ref} → {fetched_commit[:12]}"
     build_script = repository_root / "scripts" / "actquant_build.py" if repository_root else None
     build_requirements = repository_root / "requirements" / "actquant-build.txt" if repository_root else None
+    toolkit_requirements = (
+        repository_root / "requirements" / "actquant-cuda-toolkit.txt" if repository_root else None
+    )
     return (
         build_requirements,
         build_script,
@@ -163,6 +173,7 @@ def _(Path, mo, os):
         fetch_error,
         repository_root,
         repository_source,
+        toolkit_requirements,
     )
 
 
@@ -180,6 +191,7 @@ def _(
     shutil,
     subprocess,
     tempfile,
+    toolkit_requirements,
 ):
     work_dir = Path(os.environ.get("EAQ_WORK_DIR", Path(tempfile.gettempdir()) / "eaq-actquant"))
 
@@ -224,6 +236,10 @@ def _(
         + (f"`{repository_root}` ({repository_source})" if repository_root is not None
            else f"not found — {fetch_error or 'no fetch attempted'}"),
         f"- EAQ commit: `{eaq_commit}`",
+        "- CUDA toolkit pins (installed by the `toolkit` stage): "
+        + (", ".join(f"`{_l.strip()}`" for _l in toolkit_requirements.read_text(encoding="utf-8").splitlines()
+                     if "==" in _l and not _l.lstrip().startswith("#"))
+           if toolkit_requirements is not None else "not found"),
         f"- GPU: `{_gpu}`",
         f"- Work folder: `{work_dir}`; disk {_disk_text}; "
         + (f"already contains {', '.join(f'`{item}`' for item in _existing)}" if _existing else "empty"),
@@ -231,7 +247,7 @@ def _(
         "| Package | Installed | Pinned |",
         "| --- | --- | --- |",
         *(f"| `{name}` | `{_version(name)}` | `{_pins.get(name, '—')}` |"
-          for name in ("torch", "cmake", "ninja", "huggingface_hub", "pybind11", "nvidia-cuda-cccl")),
+          for name in ("torch", "cmake", "ninja", "huggingface_hub", "pybind11")),
     ]
     mo.md("\n".join(_lines))
     return (work_dir,)
@@ -240,8 +256,8 @@ def _(
 @app.cell
 def _(mo):
     stage_picker = mo.ui.multiselect(
-        options=["headers", "source", "configure", "build", "download", "infer"],
-        value=["headers", "source", "configure", "build", "download", "infer"],
+        options=["toolkit", "source", "configure", "build", "download", "infer"],
+        value=["toolkit", "source", "configure", "build", "download", "infer"],
         label="Stages (always run in this order)",
     )
     no_vmm = mo.ui.checkbox(
@@ -259,7 +275,6 @@ def _(mo):
 
 @app.cell
 def _(
-    build_requirements,
     build_script,
     collections,
     cpu_check,
@@ -278,6 +293,7 @@ def _(
     threading,
     time,
     timezone,
+    toolkit_requirements,
     work_dir,
 ):
     build_result = None
@@ -291,7 +307,7 @@ def _(
             _run_dir = work_dir / "runs" / _run_id
             _run_dir.mkdir(parents=True, exist_ok=False)
             _command = [sys.executable, str(build_script), "--output", str(_run_dir),
-                        "--work-dir", str(work_dir), "--requirements", str(build_requirements),
+                        "--work-dir", str(work_dir), "--toolkit-requirements", str(toolkit_requirements),
                         "--stages", *stage_picker.value]
             if no_vmm.value:
                 _command.append("--no-vmm")

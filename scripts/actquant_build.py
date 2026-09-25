@@ -1,12 +1,15 @@
 """Build ActQuant's Pi 0.5 runtime on a Linux GPU host and run one inference.
 
 Applies the Molab build recipe established by `cloud_preflight.py --only
-actquant`: PyTorch's pip CUDA toolkit, CCCL headers installed next to it,
-device code for the attached GPU only, unversioned library links and a
-toolkit RPATH. Stages run in order and each writes `report.json`, so a
-partial run still leaves evidence:
+actquant`, with one change found by the first build: PyTorch's pip CUDA
+toolkit mixes nvcc 13.3 with 13.0 runtime headers, which CCCL (CUB) rejects,
+so the build uses a private, version-consistent CUDA toolkit installed from
+pinned pip wheels into the work folder. Device code is built for the attached
+GPU only, with unversioned library links and a toolkit RPATH. Stages run in
+order and each writes `report.json`, so a partial run still leaves evidence:
 
-  headers    install nvidia-cuda-cccl next to PyTorch's nvcc, if missing
+  toolkit    install the pinned CUDA toolkit wheels into the work folder and
+             check that nvcc, runtime headers and CCCL agree (compiles CUB)
   source     fetch ActQuant at its pinned commit and unpack vendored code
   configure  CMake + Ninja configure of the pi05 runtime
   build      build pi05, llama-quantize and, when possible, the pi05.so binding
@@ -34,7 +37,6 @@ from pathlib import Path
 import platform
 import re
 import shutil
-import site
 import subprocess
 import sys
 import sysconfig
@@ -54,10 +56,16 @@ CHECKPOINT_FILES = {
     "tokenizer.model": "8986bb4f423f07f8c7f70d0dbe3526fb2316056c17bae71b1ea975e77a168fc6",
     "norm_stats.json": None,
 }
-CCCL_FALLBACK_SPEC = "nvidia-cuda-cccl==13.3.3.4.1"
 BUILD_TARGETS = ("pi05", "llama-quantize")
 DEFAULT_PROMPT = "put the black bowl on the plate"
-STAGES = ("headers", "source", "configure", "build", "download", "infer")
+STAGES = ("toolkit", "source", "configure", "build", "download", "infer")
+# Compiled by the toolkit stage: the first build failed only in the one ggml file using CUB.
+TOOLKIT_PROBE = """
+#include <cuda_fp16.h>
+#include <cub/cub.cuh>
+__global__ void eaq_probe(const half *x, float *y) { y[threadIdx.x] = __half2float(x[threadIdx.x]); }
+int main() { return 0; }
+"""
 TIMEOUTS = {"configure": 15 * 60, "build": 3 * 60 * 60, "infer": 20 * 60}
 
 
@@ -135,53 +143,48 @@ def _package_version(name):
         return None
 
 
-def _site_dirs():
-    dirs = {sysconfig.get_paths()["purelib"], sysconfig.get_paths()["platlib"]}
-    try:
-        dirs.update(site.getsitepackages())
-    except AttributeError:
-        pass
-    # Molab layers a package venv (/tmp/uv-venv) over the base interpreter; sys.path sees both.
-    dirs.update(entry for entry in sys.path if entry.endswith(("site-packages", "dist-packages")))
-    return sorted(dirs)
-
-
 def _which(name):
     """Find a tool on PATH or beside this interpreter, where pip puts cmake/ninja entry points."""
     return shutil.which(name) or shutil.which(name, path=os.pathsep.join(
         {str(Path(sys.executable).parent), sysconfig.get_paths()["scripts"]}))
 
 
-def find_toolkit():
-    """Prefer the pip CUDA toolkit next to PyTorch, as the preflight recipe does; else a system nvcc."""
-    candidates = []
-    spec = importlib.util.find_spec("torch")
-    if spec is not None and spec.origin:
-        torch_site = Path(spec.origin).resolve().parents[1]
-        candidates += sorted(torch_site.glob("nvidia/cu*/bin/nvcc"), reverse=True)
-    for directory in _site_dirs():
-        candidates += sorted(Path(directory).glob("nvidia/cu*/bin/nvcc"), reverse=True)
-    for name in filter(None, [shutil.which("nvcc"), *sorted(glob.glob("/usr/local/cuda*/bin/nvcc"))]):
-        candidates.append(Path(name))
-    for nvcc in candidates:
-        if not nvcc.is_file():
-            continue
-        result = _run([nvcc, "--version"], timeout=30)
-        match = re.search(r"release (\d+\.\d+)", result["output"])
-        root = nvcc.resolve().parent.parent
-        site_packages = next((parent for parent in root.parents
-                              if parent.name in ("site-packages", "dist-packages")), None)
-        interpreter = None
-        if site_packages is not None:  # .../lib/python3.X/site-packages -> .../bin/python3.X
-            for name in (site_packages.parent.name, "python3"):
-                candidate = site_packages.parents[2] / "bin" / name
-                if candidate.is_file():
-                    interpreter = str(candidate)
-                    break
-        return {"nvcc": str(nvcc), "version": match[1] if match else None, "root": str(root),
-                "source": "pip wheel" if site_packages is not None else "system",
-                "interpreter": interpreter}
+def _toolkit_info(nvcc, source):
+    """Versions that must agree: nvcc itself and the CUDART_VERSION of the runtime headers it will use."""
+    root = nvcc.resolve().parent.parent
+    match = re.search(r"release (\d+\.\d+)", _run([nvcc, "--version"], timeout=30)["output"])
+    runtime = None
+    try:
+        define = re.search(r"#define\s+CUDART_VERSION\s+(\d+)",
+                           (root / "include" / "cuda_runtime_api.h").read_text(encoding="utf-8", errors="replace"))
+        if define:
+            runtime = f"{int(define[1]) // 1000}.{int(define[1]) % 1000 // 10}"
+    except OSError:
+        pass
+    return {"nvcc": str(nvcc), "version": match[1] if match else None, "runtime_headers": runtime,
+            "cccl_headers": (root / "include" / "nv" / "target").is_file(), "root": str(root), "source": source}
+
+
+def find_toolkit(private_prefix):
+    """The private pinned toolkit if installed, else a system CUDA install. PyTorch's mixed pip toolkit is never used."""
+    candidates = [(path, "pinned pip wheels (private)") for path in sorted(Path(private_prefix).glob("nvidia/cu*/bin/nvcc"))]
+    candidates += [(Path(path), "system") for path in
+                   filter(None, [shutil.which("nvcc"), *sorted(glob.glob("/usr/local/cuda*/bin/nvcc"))])
+                   if "site-packages" not in path and "dist-packages" not in path]
+    for nvcc, source in candidates:
+        if nvcc.is_file():
+            return _toolkit_info(nvcc, source)
     return None
+
+
+def _toolkit_problems(toolkit):
+    problems = []
+    if not toolkit["cccl_headers"]:
+        problems.append("CCCL headers (include/nv/target) are missing")
+    if toolkit["runtime_headers"] != toolkit["version"]:
+        problems.append(f"nvcc {toolkit['version']} does not match runtime headers {toolkit['runtime_headers']}; "
+                        "CCCL rejects this mix")
+    return problems
 
 
 def gpu_info():
@@ -224,13 +227,11 @@ def _library_shim(toolkit_root, shim_dir):
     return linked, libcuda
 
 
-def _cccl_spec(requirements):
-    if requirements and Path(requirements).is_file():
-        for line in Path(requirements).read_text(encoding="utf-8").splitlines():
-            requirement = line.partition("#")[0].strip()
-            if requirement.startswith("nvidia-cuda-cccl=="):
-                return requirement
-    return CCCL_FALLBACK_SPEC
+def _read_pins(path):
+    if not path or not Path(path).is_file():
+        return []
+    return [line.partition("#")[0].strip() for line in Path(path).read_text(encoding="utf-8").splitlines()
+            if "==" in line.partition("#")[0]]
 
 
 class Builder:
@@ -240,27 +241,38 @@ class Builder:
         self.output = Path(args.output).resolve()
         self.source = self.work / "ActQuant"
         self.checkpoint = self.work / "checkpoints" / "actquant-pi05-libero-3bpw"
-        self.toolkit = find_toolkit()
+        self.toolkit_prefix = self.work / "cuda-toolkit"
+        self.toolkit = find_toolkit(self.toolkit_prefix)
         self.gpu = gpu_info()
         capability = (self.gpu or {}).get("compute_capability") or ""
         self.arch = args.cuda_arch or capability.replace(".", "") or None
-        suffix = f"sm{self.arch}" + ("-novmm" if args.no_vmm else "")
-        self.build_dir = self.work / f"build-{suffix}"
-        self.shim_dir = self.work / f"libshim-{suffix}"
         self.deviations = {}
         self.report = {
-            "schema_version": 1,
+            "schema_version": 2,
             "scope": "ActQuant Pi 0.5 build and a single-inference smoke test; no LIBERO rollout",
             "started_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "actquant": {"url": ACTQUANT_URL, "commit": ACTQUANT_COMMIT},
             "checkpoint": {"repo": CHECKPOINT_REPO, "revision": CHECKPOINT_REVISION},
             "options": {"stages": args.stages, "cuda_arch": self.arch, "no_vmm": args.no_vmm,
                         "jobs": args.jobs, "cpu_check": args.cpu_check, "prompt": args.prompt,
-                        "work_dir": str(self.work), "build_dir": str(self.build_dir)},
+                        "work_dir": str(self.work)},
             "host": self._host(),
-            "toolkit": self.toolkit,
             "stages": {},
         }
+
+    @property
+    def _suffix(self):
+        # One tree per architecture, toolkit version and VMM setting: CMake cannot switch compilers in place.
+        version = (self.toolkit or {}).get("version") or "none"
+        return f"sm{self.arch}-cu{version}" + ("-novmm" if self.args.no_vmm else "")
+
+    @property
+    def build_dir(self):
+        return self.work / f"build-{self._suffix}"
+
+    @property
+    def shim_dir(self):
+        return self.work / f"libshim-{self._suffix}"
 
     def _host(self):
         memory = None
@@ -285,7 +297,8 @@ class Builder:
                 "platform": platform.platform(), "cpus": cpus, "memory_gib": memory, "disk": disk,
                 "gpu": self.gpu, "tools": {name: self._tool_version(name) for name in ("cmake", "ninja", "gcc", "git")},
                 "packages": {name: _package_version(name) for name in (
-                    "torch", "nvidia-cuda-cccl", "pybind11", "huggingface_hub", "cmake", "ninja")}}
+                    "torch", "nvidia-cuda-nvcc", "nvidia-cuda-runtime", "pybind11", "huggingface_hub",
+                    "cmake", "ninja")}}
 
     @staticmethod
     def _tool_version(name):
@@ -301,6 +314,8 @@ class Builder:
         self.deviations[key] = text
 
     def save(self):
+        self.report["toolkit"] = self.toolkit
+        self.report["options"]["build_dir"] = str(self.build_dir)
         self.report["deviations"] = list(self.deviations.values())
         self.report["finished_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
         (self.output / "report.json").write_text(json.dumps(self.report, indent=2) + "\n", encoding="utf-8")
@@ -347,41 +362,75 @@ class Builder:
 
     def _require_toolkit(self):
         if self.toolkit is None:
-            raise StageError("No nvcc found (neither PyTorch's pip toolkit nor a system CUDA toolkit).")
+            raise StageError("No CUDA toolkit found; run the toolkit stage.")
+        problems = _toolkit_problems(self.toolkit)
+        if problems:
+            raise StageError("Inconsistent CUDA toolkit: " + "; ".join(problems) + ".", {"toolkit": self.toolkit})
         return self.toolkit
 
-    def stage_headers(self):
-        toolkit = self._require_toolkit()
-        target = Path(toolkit["root"]) / "include" / "nv" / "target"
-        spec = _cccl_spec(self.args.requirements)
-        details = {"requested": spec, "toolkit": toolkit["root"], "interpreter": toolkit["interpreter"]}
-        cccl_version = _version_tuple(spec.split("==")[-1])
-        if cccl_version and _version_tuple(toolkit["version"]) != cccl_version:
-            details["warning"] = (f"CCCL pin {spec} does not match nvcc {toolkit['version']}; "
-                                  "update the pin in requirements/actquant-build.txt.")
-        if toolkit["source"] == "pip wheel":
-            self.deviation("cccl", f"CCCL headers from the pip wheel {spec}, installed with --no-deps next "
-                                   "to PyTorch's toolkit.")
-        if target.is_file():
-            return {**details, "note": "CCCL headers already present; nothing installed."}
-        if toolkit["interpreter"] is None:
-            raise StageError("CCCL headers are missing and the toolkit's owning interpreter is unknown.", details)
-        commands = []
-        if _which("uv"):
-            commands.append([_which("uv"), "pip", "install", "--python", toolkit["interpreter"], "--system",
-                             "--break-system-packages", "--no-deps", spec])
-        commands.append([toolkit["interpreter"], "-m", "pip", "install", "--no-deps",
-                         "--break-system-packages", spec])
-        attempts = []
-        for command in commands:
-            result = _run(command, timeout=600)
-            attempts.append({"command": command, "returncode": result["returncode"],
-                             "output": result["output"][-1500:]})
-            if result["returncode"] == 0 and target.is_file():
-                break
-        details["attempts"] = attempts
-        if not target.is_file():
-            raise StageError(f"Could not install CCCL headers into {toolkit['root']}.", details)
+    def stage_toolkit(self):
+        pins = _read_pins(self.args.toolkit_requirements)
+        if not pins:
+            raise StageError(f"No toolkit pins found in {self.args.toolkit_requirements}.")
+        nvcc_pin = next((pin for pin in pins if pin.startswith("nvidia-cuda-nvcc==")), None)
+        wanted = _version_tuple(nvcc_pin.split("==")[1]) if nvcc_pin else None
+        driver = _version_tuple((self.gpu or {}).get("driver_cuda"))
+        details = {"pins": pins, "prefix": str(self.toolkit_prefix), "driver_cuda": (self.gpu or {}).get("driver_cuda")}
+        if wanted is None:
+            raise StageError("The toolkit pins do not include nvidia-cuda-nvcc.", details)
+        if driver and wanted > driver:
+            raise StageError(f"Pinned nvcc {wanted[0]}.{wanted[1]} is newer than the driver's CUDA "
+                             f"{driver[0]}.{driver[1]}.", details)
+
+        marker = self.toolkit_prefix / "eaq-pins.txt"
+        if marker.is_file() and marker.read_text(encoding="utf-8").splitlines() == pins:
+            details["note"] = "Pinned toolkit already installed in the work folder."
+        else:
+            if self.toolkit_prefix.exists():
+                shutil.rmtree(self.toolkit_prefix)
+            commands = []
+            if _which("uv"):
+                commands.append([_which("uv"), "pip", "install", "--python", sys.executable,
+                                 "--target", self.toolkit_prefix, "--no-deps", *pins])
+            commands.append([sys.executable, "-m", "pip", "install", "--target", self.toolkit_prefix,
+                             "--no-deps", *pins])
+            attempts = []
+            for command in commands:
+                log(f"installing the pinned CUDA toolkit ({len(pins)} wheels, about 0.5 GB)")
+                result = _run(command, timeout=1800)
+                attempts.append({"command": [str(part) for part in command], "returncode": result["returncode"],
+                                 "output": result["output"][-1500:]})
+                if result["returncode"] == 0:
+                    break
+                shutil.rmtree(self.toolkit_prefix, ignore_errors=True)
+            details["attempts"] = attempts
+            if attempts[-1]["returncode"] != 0:
+                raise StageError("Could not install the pinned CUDA toolkit wheels.", details)
+            marker.write_text("\n".join(pins) + "\n", encoding="utf-8")
+
+        self.toolkit = find_toolkit(self.toolkit_prefix)
+        details["toolkit"] = self.toolkit
+        if self.toolkit is None or self.toolkit["source"] == "system":
+            raise StageError("The installed wheels did not produce nvidia/cu*/bin/nvcc.", details)
+        if _version_tuple(self.toolkit["version"]) != wanted:
+            raise StageError(f"Installed nvcc reports {self.toolkit['version']}, expected "
+                             f"{wanted[0]}.{wanted[1]}.", details)
+        self._require_toolkit()
+
+        # Compile (not run) CUB + cuda_fp16 for this GPU: seconds here instead of a failed long build.
+        if self.arch:
+            probe_dir = self.output / "toolkit_probe"
+            probe_dir.mkdir(exist_ok=True)
+            (probe_dir / "probe.cu").write_text(TOOLKIT_PROBE, encoding="utf-8")
+            result = _run([self.toolkit["nvcc"], "-std=c++17", f"-arch=sm_{self.arch}", "-c",
+                           probe_dir / "probe.cu", "-o", probe_dir / "probe.o"], timeout=300)
+            details["cub_compile"] = {"returncode": result["returncode"], "output": result["output"][-2000:]}
+            if result["returncode"] != 0:
+                raise StageError("The pinned toolkit cannot compile CUB for this GPU (see cub_compile).", details)
+        self.deviation("toolkit", f"CUDA toolkit {self.toolkit['version']} from pinned pip wheels in a private "
+                                  f"folder ({self.toolkit_prefix}), instead of the system CUDA 12.6 ActQuant "
+                                  "documents. PyTorch's own pip toolkit mixes nvcc 13.3 with 13.0 runtime "
+                                  "headers, which CCCL rejects.")
         return details
 
     def stage_source(self):
@@ -433,8 +482,6 @@ class Builder:
             raise StageError("ActQuant sources are missing; run the source stage.")
         if not self.arch:
             raise StageError("No GPU compute capability found; attach a GPU or pass --cuda-arch.")
-        if not (Path(toolkit["root"]) / "include" / "nv" / "target").is_file():
-            raise StageError("CCCL headers are missing from the toolkit; run the headers stage.")
         linked, libcuda = _library_shim(toolkit["root"], self.shim_dir)
         binding, binding_reasons = self._binding_plan()
         base = [cmake, "-S", self.source, "-B", self.build_dir,
@@ -467,8 +514,8 @@ class Builder:
         architectures = re.findall(r"Using CUDA architectures: (.*)", log_path.read_text(encoding="utf-8"))
         details["cuda_architectures_reported"] = architectures[-1] if architectures else None
         self.report["binding"] = {"enabled": binding, "skipped_because": binding_reasons}
-        self.deviation("toolkit", f"CUDA toolkit: {toolkit['source']} nvcc {toolkit['version']} at "
-                                  f"{toolkit['root']} (ActQuant documents CUDA 12.6 for Pi 0.5).")
+        self.deviations.setdefault("toolkit", f"CUDA toolkit: {toolkit['source']} nvcc {toolkit['version']} "
+                                              f"at {toolkit['root']} (ActQuant documents CUDA 12.6 for Pi 0.5).")
         self.deviation("arch", f"CMAKE_CUDA_ARCHITECTURES={self.arch}: device code for this GPU only "
                                "(ActQuant's README leaves it to ggml's default).")
         self.deviation("libs", "Unversioned library links in a scratch folder (CMAKE_LIBRARY_PATH) and "
@@ -691,8 +738,9 @@ def main():
                         default=Path(os.environ.get("EAQ_WORK_DIR", Path(tempfile.gettempdir()) / "eaq-actquant")),
                         help="Persistent folder for sources, build trees and checkpoints.")
     parser.add_argument("--stages", nargs="+", choices=STAGES, default=list(STAGES))
-    parser.add_argument("--requirements", type=Path,
-                        default=Path(__file__).resolve().parents[1] / "requirements" / "actquant-build.txt")
+    parser.add_argument("--toolkit-requirements", type=Path,
+                        default=Path(__file__).resolve().parents[1] / "requirements" / "actquant-cuda-toolkit.txt",
+                        help="Pinned CUDA toolkit wheels installed by the toolkit stage.")
     parser.add_argument("--cuda-arch", help="Override the GPU architecture, e.g. 120.")
     parser.add_argument("--jobs", type=int, help="Parallel build jobs (default: CPUs, limited by RAM).")
     parser.add_argument("--no-vmm", action="store_true", help="Build with GGML_CUDA_NO_VMM=ON.")
