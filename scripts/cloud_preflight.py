@@ -244,7 +244,30 @@ def _site_dirs():
         dirs.add(site.getusersitepackages())
     except AttributeError:  # some virtualenvs lack getsitepackages
         pass
+    # Molab layers a package venv (/tmp/uv-venv) over the base interpreter; sys.path sees both.
+    dirs.update(entry for entry in sys.path if entry.endswith(("site-packages", "dist-packages")))
     return sorted(dirs)
+
+
+def find_cccl_includes():
+    """Include dirs of pip-installed CCCL (nvidia-cuda-cccl), which may sit in a different site-packages than nvcc."""
+    found = []
+    for directory in _site_dirs():
+        for target in sorted(glob.glob(os.path.join(directory, "nvidia", "cu*", "include", "nv", "target"))):
+            include = str(Path(target).parent.parent.resolve())
+            if include not in found:
+                found.append(include)
+    return found
+
+
+def _owning_python(toolkit_root):
+    """Best guess at the interpreter whose site-packages holds this pip toolkit."""
+    site_packages = next((parent for parent in Path(toolkit_root).parents
+                          if parent.name in ("site-packages", "dist-packages")), None)
+    if site_packages is None:
+        return None
+    candidate = site_packages.parent.parent.parent / "bin" / site_packages.parent.name  # .../lib/python3.X
+    return str(candidate) if candidate.is_file() else None
 
 
 def _which(name):
@@ -326,9 +349,19 @@ def toolchain_check():
         adaptations.append(f"CUDA toolkit comes from pip wheels at {nvcc[0]['toolkit_root']}, not a system install; "
                            "build ActQuant with -DCUDAToolkit_ROOT pointing there and record it.")
         # PyTorch pulls in nvcc but not CCCL (libcu++/CUB/Thrust); cuda_fp16.h needs its <nv/target>.
-        if not Path(nvcc[0]["toolkit_root"], "include", "nv", "target").is_file():
-            blockers.append(f"pip CUDA toolkit lacks CCCL headers (nv/target); install nvidia-cuda-cccl matching "
-                            f"nvcc {nvcc[0]['version']} (pinned in requirements/preflight.txt).")
+        toolkit_include = Path(nvcc[0]["toolkit_root"], "include")
+        if not (toolkit_include / "nv" / "target").is_file():
+            elsewhere = [include for include in find_cccl_includes() if Path(include) != toolkit_include.resolve()]
+            if elsewhere:
+                owner = _owning_python(nvcc[0]["toolkit_root"]) or "the interpreter that owns it"
+                blockers.append(
+                    f"CCCL headers are installed in a different environment ({elsewhere[0]}) from nvcc's toolkit "
+                    f"({toolkit_include}); nvcc and CMake only search their own tree. Install nvidia-cuda-cccl into "
+                    f"nvcc's environment, e.g. uv pip install --python {owner} --system --break-system-packages "
+                    "nvidia-cuda-cccl==<pinned version>.")
+            else:
+                blockers.append(f"pip CUDA toolkit lacks CCCL headers (nv/target); install nvidia-cuda-cccl matching "
+                                f"nvcc {nvcc[0]['version']} (pinned in requirements/preflight.txt).")
     return {"tools": tools, "nvcc": nvcc, "blockers": blockers, "adaptations": adaptations}
 
 
@@ -410,11 +443,11 @@ def disk_check(output_dir):
             "note": "Free space is a snapshot on possibly ephemeral scratch storage."}
 
 
-def _compile_and_run(nvcc, workdir, name, gencode):
+def _compile_and_run(nvcc, workdir, name, gencode, extra_flags=()):
     source = workdir / "probe.cu"
     source.write_text(KERNEL_SOURCE, encoding="utf-8")
     binary = workdir / name
-    compile_result = _run([nvcc, *gencode, "-O2", "-o", str(binary), str(source)], timeout=300)
+    compile_result = _run([nvcc, *gencode, *extra_flags, "-O2", "-o", str(binary), str(source)], timeout=300)
     if compile_result["returncode"] != 0:
         return {"gencode": gencode, "compiled": False, "ran": False, "output": compile_result["output"]}
     env = dict(os.environ, CUDA_CACHE_DISABLE="1")  # force a real JIT for PTX-only binaries
@@ -433,11 +466,23 @@ def cuda_compile_check(workdir):
         return {"nvcc": nvcc[0], "blockers": ["No visible NVIDIA GPU (torch/nvidia-smi); attach the GPU and restart."]}
     arch = f"{capability[0]}{capability[1]}"
     compiler = nvcc[0]["path"]
-    native = _compile_and_run(compiler, workdir, "probe_native", ["-gencode", f"arch=compute_{arch},code=sm_{arch}"])
+    # If CCCL sits in another environment than nvcc, point nvcc at it explicitly so this check still
+    # answers whether the GPU runs freshly compiled code; the toolchain check reports the install split.
+    extra_flags = []
+    if not Path(nvcc[0]["toolkit_root"], "include", "nv", "target").is_file():
+        cccl = find_cccl_includes()
+        if cccl:
+            extra_flags = ["-I", cccl[0]]
+    native = _compile_and_run(compiler, workdir, "probe_native", ["-gencode", f"arch=compute_{arch},code=sm_{arch}"],
+                              extra_flags)
     # The ActQuant fork's default CUDA arch list ends in 75/80-virtual (PTX) and 86/89-real;
     # on newer GPUs only the PTX path can run, via driver JIT.
-    ptx = _compile_and_run(compiler, workdir, "probe_ptx80", ["-gencode", "arch=compute_80,code=compute_80"])
+    ptx = _compile_and_run(compiler, workdir, "probe_ptx80", ["-gencode", "arch=compute_80,code=compute_80"],
+                           extra_flags)
     blockers, adaptations = [], []
+    if extra_flags:
+        adaptations.append(f"Compiled with an explicit CCCL include ({extra_flags[1]}) because it is not in nvcc's "
+                           "own toolkit; ActQuant's CMake build needs it installed there instead.")
     if not (native["ran"] or ptx["ran"]):
         blockers.append("Neither native nor PTX-JIT CUDA binaries ran on this GPU.")
     elif not native["ran"]:
