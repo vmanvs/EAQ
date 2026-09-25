@@ -19,6 +19,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import site
 import socket
 import subprocess
 import sys
@@ -216,6 +217,8 @@ def _run(command, timeout=60, cwd=None, env=None):
                                 timeout=timeout, cwd=cwd, env=env)
     except FileNotFoundError:
         return {"returncode": None, "output": "not found"}
+    except OSError as exc:  # not executable, wrong binary format, ...
+        return {"returncode": None, "output": f"could not start: {type(exc).__name__}: {exc}"}
     except subprocess.TimeoutExpired:
         return {"returncode": None, "output": f"timed out after {timeout} s"}
     output = (result.stdout + result.stderr).strip()
@@ -234,12 +237,33 @@ def _parse_version(text):
     return tuple(int(part) for part in match.groups() if part is not None) if match else None
 
 
+def _site_dirs():
+    dirs = {sysconfig.get_paths()["purelib"], sysconfig.get_paths()["platlib"]}
+    try:
+        dirs.update(site.getsitepackages())
+        dirs.add(site.getusersitepackages())
+    except AttributeError:  # some virtualenvs lack getsitepackages
+        pass
+    return sorted(dirs)
+
+
+def _which(name):
+    """Find a tool on PATH or beside this interpreter, where pip puts cmake/ninja entry points."""
+    return shutil.which(name) or shutil.which(name, path=os.pathsep.join(
+        {str(Path(sys.executable).parent), sysconfig.get_paths()["scripts"]}))
+
+
 def find_nvcc():
     candidates = [shutil.which("nvcc")]
     for variable in ("CUDA_HOME", "CUDA_PATH", "CUDA_ROOT"):
         if os.environ.get(variable):
             candidates.append(str(Path(os.environ[variable]) / "bin" / "nvcc"))
     candidates += sorted(glob.glob("/usr/local/cuda*/bin/nvcc")) + sorted(glob.glob("/opt/cuda*/bin/nvcc"))
+    # CUDA 13 pip wheels (pulled in by PyTorch cu13x) install a toolkit-shaped tree at
+    # site-packages/nvidia/cu13/{bin,include,lib,nvvm}; CUDA 12 wheels use nvidia/cuda_nvcc.
+    for directory in _site_dirs():
+        candidates += sorted(glob.glob(os.path.join(directory, "nvidia", "cu*", "bin", "nvcc")))
+        candidates += sorted(glob.glob(os.path.join(directory, "nvidia", "cuda_nvcc", "bin", "nvcc")))
     found = {}
     for candidate in filter(None, candidates):
         path = Path(candidate)
@@ -250,7 +274,10 @@ def find_nvcc():
             continue
         result = _run([resolved, "--version"], timeout=20)
         match = re.search(r"release (\d+)\.(\d+)", result["output"])
-        found[resolved] = {"path": str(path), "version": f"{match[1]}.{match[2]}" if match else None}
+        found[resolved] = {"path": str(path), "version": f"{match[1]}.{match[2]}" if match else None,
+                           "toolkit_root": str(path.parent.parent),
+                           "source": "pip wheel" if "site-packages" in resolved or "dist-packages" in resolved
+                           else "system"}
     return sorted(found.values(), key=lambda item: _parse_version(item["version"]) or (0, 0), reverse=True)
 
 
@@ -274,31 +301,30 @@ def driver_cuda_version():
 
 
 def toolchain_check():
-    tools = {name: _first_line(command) for name, command in {
-        "cmake": ["cmake", "--version"], "ninja": ["ninja", "--version"], "make": ["make", "--version"],
-        "gcc": ["gcc", "--version"], "g++": ["g++", "--version"], "git": ["git", "--version"],
-        "conda": ["conda", "--version"], "mamba": ["mamba", "--version"],
-        "micromamba": ["micromamba", "--version"], "uv": ["uv", "--version"],
-    }.items()}
+    tools = {name: _first_line([_which(name) or name, "--version"]) for name in (
+        "cmake", "ninja", "make", "gcc", "g++", "git", "conda", "mamba", "micromamba", "uv")}
     nvcc = find_nvcc()
     blockers, adaptations = [], []
     if not nvcc:
         blockers.append("No CUDA toolkit (nvcc) found; ActQuant's C++/CUDA runtime cannot be built.")
     cmake_version = _parse_version(tools["cmake"])
     if cmake_version is None:
-        blockers.append("cmake missing (pip install cmake is a user-space fix; record it).")
+        blockers.append("cmake missing; install the pinned cmake from requirements/preflight.txt.")
     elif cmake_version[:2] < MIN_CMAKE:
         blockers.append(f"cmake {tools['cmake']} is older than {MIN_CMAKE[0]}.{MIN_CMAKE[1]}.")
     if not tools["g++"]:
         blockers.append("No C++ compiler (g++).")
     if not (tools["ninja"] or tools["make"]):
-        blockers.append("No build tool (ninja or make); pip install ninja is a user-space fix.")
+        blockers.append("No build tool (ninja or make); install the pinned ninja from requirements/preflight.txt.")
     if not tools["git"]:
         blockers.append("git missing.")
     if not (tools["conda"] or tools["mamba"] or tools["micromamba"]):
         adaptations.append("No conda: ActQuant's 01_setup_env.sh assumes conda; use uv/venv or micromamba and record it.")
     if not tools["uv"]:
         adaptations.append("uv missing: needed by the Pi 0.5 setup (pip install uv).")
+    if nvcc and nvcc[0]["source"] == "pip wheel":
+        adaptations.append(f"CUDA toolkit comes from pip wheels at {nvcc[0]['toolkit_root']}, not a system install; "
+                           "build ActQuant with -DCUDAToolkit_ROOT pointing there and record it.")
     return {"tools": tools, "nvcc": nvcc, "blockers": blockers, "adaptations": adaptations}
 
 
@@ -307,7 +333,13 @@ def system_access_check():
     sudo = _run(["sudo", "-n", "true"], timeout=10) if shutil.which("sudo") else {"returncode": None, "output": "not found"}
     can_elevate = euid == 0 or sudo["returncode"] == 0
     apt = shutil.which("apt-get")
-    apt_simulation = _run(["apt-get", "-s", "install", "libegl1-mesa-dev"], timeout=60) if apt else None
+    apt_simulation = None
+    if apt:
+        # ActQuant's README names libegl1-mesa-dev; Debian 13 ships the headers as libegl-dev.
+        for package in ("libegl1-mesa-dev", "libegl-dev"):
+            apt_simulation = {"package": package, **_run(["apt-get", "-s", "install", package], timeout=60)}
+            if apt_simulation["returncode"] == 0:
+                break
     egl_library = ctypes.util.find_library("EGL")
     purelib = sysconfig.get_paths()["purelib"]
     os_release = {}
@@ -412,10 +444,23 @@ def cuda_compile_check(workdir):
             "blockers": blockers, "adaptations": adaptations}
 
 
+def _unversioned_library_shim(toolkit_root, shim_dir):
+    """Link lib*.so -> lib*.so.N for pip toolkits, which ship only versioned sonames."""
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    linked = []
+    for library in sorted(Path(toolkit_root, "lib").glob("lib*.so.*")):
+        unversioned = library.name.split(".so.")[0] + ".so"
+        if not (library.parent / unversioned).exists() and not (shim_dir / unversioned).exists():
+            (shim_dir / unversioned).symlink_to(library)
+            linked.append(unversioned)
+    return linked
+
+
 def cmake_cuda_check(workdir):
     nvcc = find_nvcc()
     capability = gpu_compute_capability()
-    if not nvcc or capability is None or not shutil.which("cmake"):
+    cmake, ninja = _which("cmake"), _which("ninja")
+    if not nvcc or capability is None or not cmake:
         return {"blockers": ["Requires nvcc, a visible GPU and cmake; see the toolchain and CUDA checks."]}
     (workdir / "probe.cu").write_text(KERNEL_SOURCE, encoding="utf-8")
     (workdir / "CMakeLists.txt").write_text(
@@ -426,25 +471,42 @@ def cmake_cuda_check(workdir):
         "target_compile_definitions(probe PRIVATE EAQ_WITH_CUBLAS)\n"
         "target_link_libraries(probe PRIVATE CUDA::cudart CUDA::cublas)\n", encoding="utf-8")
     arch = f"{capability[0]}{capability[1]}"
-    generator = ["-G", "Ninja"] if shutil.which("ninja") else []
-    configure = _run(["cmake", "-S", str(workdir), "-B", str(workdir / "build"), *generator,
-                      f"-DCMAKE_CUDA_COMPILER={nvcc[0]['path']}", f"-DCMAKE_CUDA_ARCHITECTURES={arch}",
-                      "-DCMAKE_BUILD_TYPE=Release"], timeout=300)
-    result = {"nvcc": nvcc[0], "cuda_architectures": arch, "configure": configure}
-    if configure["returncode"] != 0:
-        result["blockers"] = ["CMake could not configure a CUDA + cuBLAS project (ggml-cuda needs both)."]
-        return result
-    build = _run(["cmake", "--build", str(workdir / "build")], timeout=600)
-    result["build"] = build
-    if build["returncode"] != 0:
-        result["blockers"] = ["CMake CUDA + cuBLAS build failed."]
-        return result
-    binary = next((path for path in (workdir / "build").rglob("probe*")
-                   if path.is_file() and path.name in ("probe", "probe.exe")), None)
-    run = _run([str(binary)], timeout=120) if binary else {"returncode": None, "output": "binary not found"}
-    result["run"] = run
-    result["blockers"] = [] if run["returncode"] == 0 and run["output"].startswith("OK") else [
-        "CMake-built CUDA + cuBLAS binary did not run correctly."]
+    toolkit = nvcc[0]
+    base_arguments = [cmake, "-S", str(workdir),
+                      *(["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"] if ninja else []),
+                      f"-DCMAKE_CUDA_COMPILER={toolkit['path']}", f"-DCUDAToolkit_ROOT={toolkit['toolkit_root']}",
+                      f"-DCMAKE_CUDA_ARCHITECTURES={arch}", "-DCMAKE_BUILD_TYPE=Release"]
+    attempts = [("as installed", [])]
+    if toolkit["source"] == "pip wheel":
+        attempts.append(("with unversioned .so links", None))
+    result = {"nvcc": toolkit, "cuda_architectures": arch, "attempts": []}
+    for label, extra in attempts:
+        build_dir = workdir / f"build-{len(result['attempts'])}"
+        attempt = {"label": label}
+        if extra is None:
+            shim = workdir / "libshim"
+            attempt["linked"] = _unversioned_library_shim(toolkit["toolkit_root"], shim)
+            extra = [f"-DCMAKE_LIBRARY_PATH={shim}"]
+        attempt["configure"] = _run([*base_arguments, "-B", str(build_dir), *extra], timeout=300)
+        if attempt["configure"]["returncode"] == 0:
+            attempt["build"] = _run([cmake, "--build", str(build_dir)], timeout=600)
+            if attempt["build"]["returncode"] == 0:
+                binary = next((path for path in build_dir.rglob("probe*")
+                               if path.is_file() and path.name in ("probe", "probe.exe")), None)
+                attempt["run"] = (_run([str(binary)], timeout=120) if binary
+                                  else {"returncode": None, "output": "binary not found"})
+        result["attempts"].append(attempt)
+        run = attempt.get("run", {})
+        if run.get("returncode") == 0 and run.get("output", "").startswith("OK"):
+            result["working_setup"] = label
+            break
+    blockers, adaptations = [], []
+    if "working_setup" not in result:
+        blockers.append("No CMake setup could configure, build and run a CUDA + cuBLAS binary (ggml-cuda needs this).")
+    elif result["working_setup"] != "as installed":
+        adaptations.append("CMake needs unversioned CUDA library links (lib*.so -> lib*.so.N) for the pip toolkit; "
+                           "create them before building ActQuant and record it.")
+    result.update(blockers=blockers, adaptations=adaptations)
     return result
 
 

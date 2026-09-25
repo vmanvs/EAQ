@@ -3,3 +3,6 @@ mujoco==3.3.2
 Pillow==11.3.0
 psutil==7.0.0
 huggingface_hub==0.34.4
+# Build tools for the ActQuant CUDA/CMake checks (pip wheels ship the binaries).
+cmake==4.4.3
+ninja==1.13.2
