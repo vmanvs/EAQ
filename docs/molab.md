@@ -83,7 +83,7 @@ Observed on 2026-09-25 (EAQ commit `1ad08ef`); verdict
 | --- | --- |
 | GPU | NVIDIA RTX PRO 6000 Blackwell Server Edition, 95 GiB, compute capability 12.0 (sm_120) |
 | Driver | 595.71.05, supporting CUDA 13.2 |
-| Host | gVisor sandbox, Debian 13, glibc 2.41, 160 GiB RAM, root with apt |
+| Host | gVisor sandbox, Debian 13, glibc 2.41, root with apt. The sandbox reports 20 CPUs and 160 GiB, but Molab allots each notebook 4 CPUs and 32 GiB and ends the session when that is exceeded |
 | Python | 3.13; PyTorch 2.11.0 built for CUDA 13.0 |
 | CUDA toolkit | No system toolkit. Pip packages install a mixed toolkit under `site-packages/nvidia/cu13`: nvcc 13.3 with the 13.0 runtime headers PyTorch pins |
 | Disk | Not measurable: the sandbox reports a placeholder size |
@@ -134,7 +134,7 @@ notebook below.
 
 Open questions: whether ActQuant's own ggml kernels build and run under this
 setup (with the pinned 13.0 toolkit a build reached 232 of 234 steps before the
-notebook disconnected), why long notebook runs disconnect, real scratch-disk capacity, and whether long policy-server rollouts fit
+session ended, probably at the 32 GiB limit), real scratch-disk capacity, and whether long policy-server rollouts fit
 Molab's [usage restrictions](https://molab.marimo.io/pages/molab/restrictions)
 and 12-hour session limit.
 
@@ -154,14 +154,20 @@ through the GitHub API.
 
 The script runs as a separate process that writes to a log file, not as a
 child tied to the notebook's output. Before this change, every notebook
-disconnect ended the build: its output pipe broke. If the notebook
-disconnects now, reopen it or rerun the run cell. It reattaches to the
-running build, or shows the result if the build finished in the meantime. A
-lock on the work folder prevents a second build from starting while one is
-running. During the build, `memory.log` records available memory (and the
-cgroup's usage and limit, when visible) every 15 seconds, so out-of-memory
-kills can be told apart from disconnects. By default at most 8 compile jobs
-run at once; the notebook's jobs setting overrides this.
+disconnect ended the build: its output pipe broke. The status cell refreshes
+itself on a timer instead of blocking the kernel. After a reconnect, it picks
+the run up again, or shows its result if it finished in the meantime. The
+run's ZIP can be downloaded at any time; while the build is running it is a
+snapshot of the logs so far. A lock on the work folder prevents a second
+build from starting while one is running.
+
+Early builds ran 20 and then 8 compile jobs, sized from the 20 CPUs and
+160 GiB that the sandbox reports. Those runs were cut off during the build,
+at up to 232 of 234 steps. The default is now 4 jobs, matching the notebook's
+real 4 CPUs and keeping peak memory well below 32 GiB; the notebook's jobs
+setting overrides it. During the build, `memory.log` records every 15 seconds
+the resident memory of all processes (what the 32 GiB limit counts) and the
+available memory reported by the sandbox, and the log warns above 24 GiB.
 
 | Stage | What it does |
 | --- | --- |

@@ -83,6 +83,11 @@ int main() {
 }
 """
 TIMEOUTS = {"configure": 15 * 60, "build": 3 * 60 * 60, "infer": 20 * 60}
+# Molab gives each notebook 4 CPUs and 32 GiB, but its sandbox reports the host's 20 CPUs and
+# 160 GiB, and the controller ends the session when the limit is exceeded. More compile jobs than
+# CPUs gains nothing, and 4 jobs at up to 4 GiB each stays well inside 32 GiB.
+DEFAULT_MAX_JOBS = 4
+GIB_PER_JOB = 4
 
 
 class StageError(RuntimeError):
@@ -120,8 +125,18 @@ def _read_bytes_value(path):
 
 
 def memory_sample():
-    """Available memory and, when the sandbox exposes one, the cgroup's usage and limit, in GiB."""
+    """Memory in GiB: available per /proc/meminfo, the resident total of all visible processes
+    (what a per-notebook limit counts), and the cgroup's usage and limit when exposed."""
     sample = {}
+    if os.path.isdir("/proc"):
+        pages = 0
+        for statm in glob.glob("/proc/[0-9]*/statm"):
+            try:
+                with open(statm, encoding="utf-8") as handle:
+                    pages += int(handle.read().split()[1])
+            except (OSError, ValueError, IndexError):
+                pass
+        sample["processes_rss_gib"] = round(pages * os.sysconf("SC_PAGE_SIZE") / 2**30, 1)
     try:
         with open("/proc/meminfo", encoding="utf-8") as handle:
             fields = dict(line.split(":", 1) for line in handle if ":" in line)
@@ -143,10 +158,11 @@ def memory_sample():
 class MemoryWatch:
     """Log memory every few seconds during a long stage, to tell out-of-memory kills from disconnects."""
 
-    def __init__(self, log_path, interval=15, low_gib=8.0):
-        self.log_path, self.interval, self.low_gib = log_path, interval, low_gib
+    def __init__(self, log_path, interval=15, low_gib=8.0, high_rss_gib=24.0):
+        self.log_path, self.interval, self.low_gib, self.high_rss_gib = log_path, interval, low_gib, high_rss_gib
         self.min_available = None
         self.max_cgroup_used = None
+        self.max_rss = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
@@ -165,20 +181,36 @@ class MemoryWatch:
                 sample = memory_sample()
                 handle.write(json.dumps({"time": dt.datetime.now().strftime("%H:%M:%S"), **sample}) + "\n")
                 handle.flush()
-                available = sample.get("available_gib")
+                available, rss = sample.get("available_gib"), sample.get("processes_rss_gib")
                 if available is not None:
                     self.min_available = min(available, self.min_available if self.min_available is not None
                                              else available)
-                    if available < self.low_gib and time.monotonic() - last_warning > 60:
-                        last_warning = time.monotonic()
-                        log(f"low memory: {available} GiB available")
+                if rss is not None:
+                    self.max_rss = max(rss, self.max_rss or 0.0)
+                if ((available is not None and available < self.low_gib)
+                        or (rss is not None and rss > self.high_rss_gib)) and time.monotonic() - last_warning > 60:
+                    last_warning = time.monotonic()
+                    log(f"high memory use: {rss} GiB resident in all processes, {available} GiB available")
                 if "cgroup_used_gib" in sample:
                     self.max_cgroup_used = max(sample["cgroup_used_gib"], self.max_cgroup_used or 0.0)
 
     @property
     def summary(self):
-        return {"min_available_gib": self.min_available, "max_cgroup_used_gib": self.max_cgroup_used,
-                "log": self.log_path.name}
+        return {"min_available_gib": self.min_available, "max_processes_rss_gib": self.max_rss,
+                "max_cgroup_used_gib": self.max_cgroup_used, "log": self.log_path.name}
+
+
+def cpu_quota():
+    """CPUs allowed by the cgroup (cpu.max or v1 cfs quota), or None when unlimited or hidden."""
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text(encoding="utf-8").split()[:2]
+    except (OSError, ValueError):
+        quota = _read_bytes_value("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+        period = _read_bytes_value("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    try:
+        return round(int(quota) / int(period), 1)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
 
 
 def _stream(command, log_path, timeout, cwd=None, env=None, echo=True):
@@ -383,7 +415,8 @@ class Builder:
         except AttributeError:
             cpus = os.cpu_count()
         return {"python": sys.version.split()[0], "executable": sys.executable,
-                "platform": platform.platform(), "cpus": cpus, "memory_gib": memory, "disk": disk,
+                "platform": platform.platform(), "cpus": cpus, "cpu_quota": cpu_quota(),
+                "memory_gib": memory, "disk": disk,
                 "gpu": self.gpu, "tools": {name: self._tool_version(name) for name in ("cmake", "ninja", "gcc", "git")},
                 "packages": {name: _package_version(name) for name in (
                     "torch", "nvidia-cuda-nvcc", "nvidia-cuda-runtime", "pybind11", "huggingface_hub",
@@ -668,13 +701,13 @@ class Builder:
     def _jobs(self):
         if self.args.jobs:
             return self.args.jobs
-        cpus = self.report["host"]["cpus"] or 4
-        memory = self.report["host"]["memory_gib"] or {}
+        host = self.report["host"]
+        cpus = int(host["cpu_quota"] or host["cpus"] or DEFAULT_MAX_JOBS)
+        memory = host["memory_gib"] or {}
         budgets = [value for value in (memory.get("MemAvailable"), memory.get("cgroup_limit_gib")) if value]
-        # CUDA template instances take 2-4 GiB each to compile. The cap of 8 leaves headroom in
-        # sandboxes whose real memory limit is lower than what /proc/meminfo reports.
-        by_memory = int(min(budgets) // 4) if budgets else cpus
-        return max(1, min(cpus, by_memory, 8))
+        # CUDA template instances take 2-4 GiB each to compile.
+        by_memory = int(min(budgets) // GIB_PER_JOB) if budgets else cpus
+        return max(1, min(cpus, by_memory, DEFAULT_MAX_JOBS))
 
     def stage_build(self):
         cmake = _which("cmake")
@@ -881,7 +914,7 @@ def main():
                         default=Path(__file__).resolve().parents[1] / "requirements" / "actquant-cuda-toolkit.txt",
                         help="Pinned CUDA toolkit wheels installed by the toolkit stage.")
     parser.add_argument("--cuda-arch", help="Override the GPU architecture, e.g. 120.")
-    parser.add_argument("--jobs", type=int, help="Parallel build jobs (default: CPUs, limited by memory, at most 8).")
+    parser.add_argument("--jobs", type=int, help=f"Parallel build jobs (default: CPUs, limited by memory, at most {DEFAULT_MAX_JOBS}).")
     parser.add_argument("--no-vmm", action="store_true", help="Build with GGML_CUDA_NO_VMM=ON.")
     parser.add_argument("--no-binding", action="store_true", help="Do not build the pi05.so Python binding.")
     parser.add_argument("--cpu-check", action="store_true", help="Also run the CLI on CPU and compare.")

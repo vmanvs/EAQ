@@ -12,7 +12,6 @@ def _():
     import subprocess
     import sys
     import tempfile
-    import time
     from datetime import datetime, timezone
     from importlib import metadata as importlib_metadata
     from pathlib import Path
@@ -34,7 +33,6 @@ def _():
         subprocess,
         sys,
         tempfile,
-        time,
         timezone,
     )
 
@@ -76,9 +74,9 @@ def _(mo):
         the session, so you can rerun single stages and the build continues
         where it stopped. The first build compiles ggml's CUDA kernels and can
         take a long time. The build runs as a separate process, so it keeps
-        going if the notebook disconnects: reopen the notebook (or rerun the
-        cell below the button) to reattach to it and see its result. Download
-        the run artifacts before the session ends.
+        going if the notebook disconnects; the status below the button updates
+        itself and picks the run up again after a reconnect. The run's logs can
+        be downloaded at any time, also while it is still building.
         """
     )
     return
@@ -264,14 +262,14 @@ def _(mo):
     )
     cpu_check = mo.ui.checkbox(label="Also run the CLI on CPU and compare with CUDA (slower)")
     build_jobs = mo.ui.dropdown(
-        options=["auto", "4", "8", "12", "16", "20"],
+        options=["auto", "1", "2", "4", "6", "8"],
         value="auto",
-        label="Parallel build jobs (auto: up to 8, limited by memory)",
+        label="Parallel build jobs (auto: 4, sized for Molab's 4 CPUs and 32 GiB)",
     )
     run_build = mo.ui.run_button(
         label="Run ActQuant build",
         kind="success",
-        tooltip="Runs scripts/actquant_build.py with the selected stages in a new run folder.",
+        tooltip="Starts scripts/actquant_build.py with the selected stages in a new run folder.",
     )
     mo.vstack([stage_picker, no_vmm, cpu_check, build_jobs, run_build])
     return build_jobs, cpu_check, no_vmm, run_build, stage_picker
@@ -287,7 +285,6 @@ def _(
     eaq_commit,
     fetch_error,
     json,
-    mo,
     no_vmm,
     os,
     repository_source,
@@ -295,51 +292,36 @@ def _(
     stage_picker,
     subprocess,
     sys,
-    time,
     timezone,
     toolkit_requirements,
     work_dir,
 ):
-    # The script runs detached, writing to a log file: a disconnected notebook no longer kills
-    # the build through a broken output pipe. last_run.json lets a new session reattach.
-    _last_run_file = work_dir / "last_run.json"
+    # The script runs detached with its output in a log file, so neither a disconnect nor this
+    # kernel's end stops it. last_run.json lets the status cell (and a new session) find it.
+    last_run_file = work_dir / "last_run.json"
 
-    def _read_json(path):
+    def read_json(path):
         try:
             return json.loads(Path(path).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
 
-    def _alive(pid):
+    def build_alive(pid):
         # A finished child of this kernel is a zombie with an empty cmdline, so it counts as ended.
         try:
             return b"actquant_build" in Path(f"/proc/{pid}/cmdline").read_bytes()
         except OSError:
             return False
 
-    def _log_tail(path, lines=40):
-        try:
-            with open(path, "rb") as handle:
-                handle.seek(0, os.SEEK_END)
-                handle.seek(max(0, handle.tell() - 65536))
-                text = handle.read().decode("utf-8", errors="replace")
-        except OSError:
-            return ""
-        return "\n".join(text.splitlines()[-lines:])
-
-    build_result = None
-    _notice = None
-    _process = None
-    _last = _read_json(_last_run_file)
-    _last_alive = bool(_last) and _alive(_last["pid"])
+    launch = {"notice": None, "process": None}
     if run_build.value:
+        _last = read_json(last_run_file)
         if build_script is None:
-            build_result = {"error": f"Build script not available: {fetch_error}"}
+            launch["notice"] = f"**Could not start:** build script not available: {fetch_error}"
         elif not stage_picker.value:
-            build_result = {"error": "Select at least one stage."}
-        elif _last_alive:
-            _notice = (f"Run `{_last['run_id']}` is still running, so no new run was started. "
-                       "Showing that run instead.")
+            launch["notice"] = "**Could not start:** select at least one stage."
+        elif _last and build_alive(_last["pid"]):
+            launch["notice"] = f"Run `{_last['run_id']}` is still running, so no new run was started."
         else:
             _run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + os.urandom(3).hex()
             _run_dir = work_dir / "runs" / _run_id
@@ -364,130 +346,172 @@ def _(
             _env = os.environ.copy()
             _env["PYTHONUNBUFFERED"] = "1"
             with open(_run_dir / "notebook.log", "w", encoding="utf-8") as _log_handle:
-                _process = subprocess.Popen(_command, stdin=subprocess.DEVNULL, stdout=_log_handle,
-                                            stderr=subprocess.STDOUT, env=_env, start_new_session=True)
-            _last = {"run_id": _run_id, "run_dir": str(_run_dir), "pid": _process.pid}
-            _last_run_file.write_text(json.dumps(_last) + "\n", encoding="utf-8")
-    elif _last is not None:
-        _notice = (f"Reattached to run `{_last['run_id']}`, which is still running."
-                   if _last_alive else f"Showing the last run, `{_last['run_id']}`.")
-
-    if build_result is None and _last is not None:
-        _run_dir = Path(_last["run_dir"])
-        _started = time.monotonic()
-        while (_process.poll() is None) if _process is not None else _alive(_last["pid"]):
-            _elapsed = int(time.monotonic() - _started)
-            mo.output.replace(mo.md(
-                (f"{_notice}\n\n" if _notice else "")
-                + f"**Running** (watched for {_elapsed // 60} min {_elapsed % 60} s) — `{_run_dir}`\n\n"
-                "```text\n" + _log_tail(_run_dir / "notebook.log") + "\n```"
-            ))
-            time.sleep(3)
-        mo.output.clear()
-
-        _code_text = (_run_dir / "exit_code").read_text(encoding="utf-8").strip() \
-            if (_run_dir / "exit_code").is_file() else ""
-        _exit_code = _process.returncode if _process is not None else (
-            int(_code_text) if _code_text.lstrip("-").isdigit() else None)
-        _manifest = _read_json(_run_dir / "manifest.json") or {}
-        if "finished_utc" not in _manifest:
-            _manifest["finished_utc"] = datetime.now(timezone.utc).isoformat()
-            _manifest["exit_code"] = _exit_code
-            (_run_dir / "manifest.json").write_text(json.dumps(_manifest, indent=2) + "\n", encoding="utf-8")
-        build_result = {"run_id": _last["run_id"], "run_dir": _run_dir, "exit_code": _exit_code,
-                        "report": _read_json(_run_dir / "report.json"), "notice": _notice,
-                        "log_tail": _log_tail(_run_dir / "notebook.log")}
-    return (build_result,)
+                launch["process"] = subprocess.Popen(
+                    _command, stdin=subprocess.DEVNULL, stdout=_log_handle, stderr=subprocess.STDOUT,
+                    env=_env, start_new_session=True)
+            last_run_file.write_text(json.dumps(
+                {"run_id": _run_id, "run_dir": str(_run_dir), "pid": launch["process"].pid}) + "\n",
+                encoding="utf-8")
+    return build_alive, last_run_file, launch, read_json
 
 
 @app.cell
-def _(ZIP_DEFLATED, ZipFile, build_result, io, json, mo):
-    _items = []
-    if build_result is None:
-        _items.append(mo.md("Choose stages and click **Run ActQuant build**."))
-    elif "error" in build_result:
-        _items.append(mo.md(f"**Could not start:** {build_result['error']}"))
-    else:
-        if build_result.get("notice"):
-            _items.append(mo.md(build_result["notice"]))
-        _report = build_result["report"]
-        if _report is None:
-            _items.append(mo.md(
-                f"**No report was written** (exit code `{build_result['exit_code']}`).\n\n"
-                "```text\n" + build_result["log_tail"] + "\n```"
-            ))
-        else:
-            # A report still saying "running" means the process was killed mid-stage.
-            _status = "interrupted" if _report.get("status") == "running" else _report.get("status")
-            _rows = ["| Stage | Status | Time | Note |", "| --- | --- | --- | --- |"]
-            for _stage, _entry in _report.get("stages", {}).items():
-                _note = _entry.get("error") or _entry.get("reason") or _entry.get("note") or ""
-                _entry_status = "interrupted" if _entry["status"] == "running" else _entry["status"]
-                _rows.append(f"| `{_stage}` | **{_entry_status}** | {_entry.get('seconds', '')} s | "
-                             f"{str(_note).replace('|', '/')} |")
-            _items.append(mo.md(
-                f"## Result: `{_status}`\n\n"
-                f"Run folder: `{build_result['run_dir']}`\n\n" + "\n".join(_rows)
-            ))
-            if _status == "interrupted":
-                _items.append(mo.md(
-                    "The run was killed without finishing; the table shows the stage it was in. "
-                    "`memory.log` in the ZIP shows whether memory ran low. Rerun to continue: "
-                    "the build resumes where it stopped if the work folder survived.\n\n"
-                    "```text\n" + build_result["log_tail"] + "\n```"
-                ))
+def _(mo):
+    # Re-runs the status cell on a timer instead of blocking the kernel while the build runs.
+    status_refresh = mo.ui.refresh(options=["5s", "15s", "60s"], default_interval="5s",
+                                   label="Build status refresh")
+    status_refresh
+    return (status_refresh,)
 
-            _infer = _report.get("stages", {}).get("infer", {})
-            _cuda = _infer.get("cli_cuda")
-            if _cuda:
-                _summary = [
-                    "### Inference",
-                    "",
-                    f"- CLI on `{_cuda.get('backend')}`: exit `{_cuda.get('returncode')}`, "
-                    f"{_cuda.get('inference_ms')} ms inference (includes first-call warm-up)",
-                    f"- Actions: {_cuda.get('action_dim')} dim × {_cuda.get('action_horizon')} horizon; "
-                    f"stats `{_cuda.get('stats')}`",
-                    f"- First timestep: `{_cuda.get('first_actions')}`",
-                ]
-                _binding = _infer.get("binding") or {}
-                if _binding.get("status") == "passed":
-                    _summary.append(
-                        f"- `pi05.so` binding: load {_binding['load_seconds']:.1f} s, runs "
-                        f"{', '.join(f'{t:.2f}' for t in _binding['run_seconds'])} s, "
-                        f"repeat max diff `{_binding['repeat_max_abs_diff']:.2e}`, "
-                        f"max diff vs CLI `{_infer.get('binding_vs_cli_max_abs_diff')}`"
-                    )
-                elif _binding:
-                    _summary.append(f"- `pi05.so` binding: {_binding.get('status')}")
-                if "cpu_vs_cuda_max_abs_diff" in _infer:
-                    _summary.append(f"- CPU vs CUDA max diff (first timestep): "
-                                    f"`{_infer['cpu_vs_cuda_max_abs_diff']:.4f}`")
-                _items.append(mo.md("\n".join(_summary)))
 
-            _deviations = "\n".join(f"- {item}" for item in _report.get("deviations", [])) or "- none"
-            _items.append(mo.md(f"### Deviations from ActQuant's documented setup\n\n{_deviations}"))
+@app.cell
+def _(
+    Path,
+    ZIP_DEFLATED,
+    ZipFile,
+    build_alive,
+    datetime,
+    io,
+    json,
+    last_run_file,
+    launch,
+    mo,
+    os,
+    read_json,
+    status_refresh,
+    timezone,
+):
+    status_refresh.value  # dependency: re-run on every refresh tick
 
-            _failed = _report.get("failed_stage")
-            if _failed:
-                _entry = _report["stages"][_failed]
-                _tail = _entry.get("tail") or build_result["log_tail"]
-                _items.append(mo.md(f"### `{_failed}` output tail\n\n```text\n{_tail}\n```"))
-            _items.append(mo.accordion({
-                "report.json": mo.md("```json\n" + json.dumps(_report, indent=2) + "\n```")
-            }))
+    def _log_tail(path, lines=40):
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - 65536))
+                text = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+        return "\n".join(text.splitlines()[-lines:])
 
+    def _archive(run_dir):
         # Logs, report and manifest only: build trees and the checkpoint stay in the work folder.
-        _buffer = io.BytesIO()
-        with ZipFile(_buffer, mode="w", compression=ZIP_DEFLATED) as _archive:
-            for _file in sorted(build_result["run_dir"].rglob("*")):
-                if _file.is_file():
-                    _archive.write(_file, _file.relative_to(build_result["run_dir"]))
-        _items.append(mo.download(
-            data=_buffer.getvalue(),
-            filename=f"eaq-actquant-build-{build_result['run_id']}.zip",
+        buffer = io.BytesIO()
+        with ZipFile(buffer, mode="w", compression=ZIP_DEFLATED) as archive:
+            for file in sorted(run_dir.rglob("*")):
+                if file.is_file():
+                    archive.write(file, file.relative_to(run_dir))
+        return buffer.getvalue()
+
+    _items = [mo.md(launch["notice"])] if launch["notice"] else []
+    _last = read_json(last_run_file)
+    if _last is None:
+        _items.append(mo.md("No run yet. Choose stages and click **Run ActQuant build**."))
+    else:
+        _run_dir = Path(_last["run_dir"])
+        _process = launch["process"]
+        _running = (_process.poll() is None if _process is not None and _process.pid == _last["pid"]
+                    else build_alive(_last["pid"]))
+        _report = read_json(_run_dir / "report.json")
+        _manifest = read_json(_run_dir / "manifest.json") or {}
+        # Built lazily, only when clicked: the snapshot is current at download time.
+        _download = mo.download(
+            data=lambda run_dir=_run_dir: _archive(run_dir),
+            filename=f"eaq-actquant-build-{_last['run_id']}.zip",
             mimetype="application/zip",
-            label="Download run artifacts (.zip)",
-        ))
+            label="Download run artifacts (.zip)" + (", snapshot so far" if _running else ""),
+        )
+
+        if _running:
+            try:
+                _elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(_manifest["started_utc"])
+                _elapsed_text = f"{int(_elapsed.total_seconds()) // 60} min"
+            except (KeyError, ValueError):
+                _elapsed_text = "unknown time"
+            _stage = next((name for name, entry in ((_report or {}).get("stages") or {}).items()
+                           if entry.get("status") == "running"), "starting")
+            _memory_lines = _log_tail(_run_dir / "memory.log", lines=1)
+            _memory = json.loads(_memory_lines) if _memory_lines.startswith("{") else {}
+            _memory_text = (f"; memory in use {_memory.get('processes_rss_gib')} GiB of 32, "
+                            f"{_memory.get('available_gib')} GiB reported available" if _memory else "")
+            _items.append(mo.md(
+                f"**Running** run `{_last['run_id']}`: stage `{_stage}`, started {_elapsed_text} ago"
+                f"{_memory_text}.\n\n```text\n{_log_tail(_run_dir / 'notebook.log')}\n```"
+            ))
+            _items.append(_download)
+        else:
+            _code_file = _run_dir / "exit_code"
+            _code_text = _code_file.read_text(encoding="utf-8").strip() if _code_file.is_file() else ""
+            _exit_code = _process.returncode if _process is not None and _process.pid == _last["pid"] else (
+                int(_code_text) if _code_text.lstrip("-").isdigit() else None)
+            if "finished_utc" not in _manifest:
+                _manifest["finished_utc"] = datetime.now(timezone.utc).isoformat()
+                _manifest["exit_code"] = _exit_code
+                (_run_dir / "manifest.json").write_text(json.dumps(_manifest, indent=2) + "\n",
+                                                        encoding="utf-8")
+            if _report is None:
+                _items.append(mo.md(
+                    f"**No report was written** for run `{_last['run_id']}` (exit code `{_exit_code}`).\n\n"
+                    "```text\n" + _log_tail(_run_dir / "notebook.log") + "\n```"
+                ))
+            else:
+                # A report still saying "running" means the process was killed mid-stage.
+                _status = "interrupted" if _report.get("status") == "running" else _report.get("status")
+                _rows = ["| Stage | Status | Time | Note |", "| --- | --- | --- | --- |"]
+                for _name, _entry in _report.get("stages", {}).items():
+                    _note = _entry.get("error") or _entry.get("reason") or _entry.get("note") or ""
+                    _entry_status = "interrupted" if _entry["status"] == "running" else _entry["status"]
+                    _rows.append(f"| `{_name}` | **{_entry_status}** | {_entry.get('seconds', '')} s | "
+                                 f"{str(_note).replace('|', '/')} |")
+                _items.append(mo.md(
+                    f"## Result: `{_status}`\n\n"
+                    f"Run folder: `{_run_dir}`\n\n" + "\n".join(_rows)
+                ))
+                if _status == "interrupted":
+                    _items.append(mo.md(
+                        "The run was killed without finishing; the table shows the stage it was in. "
+                        "`memory.log` in the ZIP shows whether memory use was near the 32 GiB limit. "
+                        "Rerun to continue: the build resumes where it stopped if the work folder "
+                        "survived.\n\n```text\n" + _log_tail(_run_dir / "notebook.log") + "\n```"
+                    ))
+
+                _infer = _report.get("stages", {}).get("infer", {})
+                _cuda = _infer.get("cli_cuda")
+                if _cuda:
+                    _summary = [
+                        "### Inference",
+                        "",
+                        f"- CLI on `{_cuda.get('backend')}`: exit `{_cuda.get('returncode')}`, "
+                        f"{_cuda.get('inference_ms')} ms inference (includes first-call warm-up)",
+                        f"- Actions: {_cuda.get('action_dim')} dim × {_cuda.get('action_horizon')} horizon; "
+                        f"stats `{_cuda.get('stats')}`",
+                        f"- First timestep: `{_cuda.get('first_actions')}`",
+                    ]
+                    _binding = _infer.get("binding") or {}
+                    if _binding.get("status") == "passed":
+                        _summary.append(
+                            f"- `pi05.so` binding: load {_binding['load_seconds']:.1f} s, runs "
+                            f"{', '.join(f'{t:.2f}' for t in _binding['run_seconds'])} s, "
+                            f"repeat max diff `{_binding['repeat_max_abs_diff']:.2e}`, "
+                            f"max diff vs CLI `{_infer.get('binding_vs_cli_max_abs_diff')}`"
+                        )
+                    elif _binding:
+                        _summary.append(f"- `pi05.so` binding: {_binding.get('status')}")
+                    if "cpu_vs_cuda_max_abs_diff" in _infer:
+                        _summary.append(f"- CPU vs CUDA max diff (first timestep): "
+                                        f"`{_infer['cpu_vs_cuda_max_abs_diff']:.4f}`")
+                    _items.append(mo.md("\n".join(_summary)))
+
+                _deviations = "\n".join(f"- {item}" for item in _report.get("deviations", [])) or "- none"
+                _items.append(mo.md(f"### Deviations from ActQuant's documented setup\n\n{_deviations}"))
+
+                _failed = _report.get("failed_stage")
+                if _failed:
+                    _tail = _report["stages"][_failed].get("tail") or _log_tail(_run_dir / "notebook.log")
+                    _items.append(mo.md(f"### `{_failed}` output tail\n\n```text\n{_tail}\n```"))
+                _items.append(mo.accordion({
+                    "report.json": mo.md("```json\n" + json.dumps(_report, indent=2) + "\n```")
+                }))
+            _items.append(_download)
     mo.vstack(_items)
     return
 
