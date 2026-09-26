@@ -1,0 +1,11 @@
+# ActQuant's tools/pi0.5/serve_policy.py, run unmodified in its own venv with the Python that
+# pi05.so was built for (3.13, as on Molab). ActQuant's 01_setup_env.sh installs these unpinned.
+# Compiled into libero-server.txt:
+#   uv pip compile requirements/libero-server.in -o requirements/libero-server.txt \
+#     --python-version 3.13 --python-platform x86_64-manylinux_2_28
+msgpack
+numpy
+# Headless build: the server only resizes images, and the full build needs libGL.
+opencv-python-headless
+# serve_policy.py uses the websockets.asyncio server API (websockets 13+).
+websockets

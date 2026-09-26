@@ -203,8 +203,64 @@ are all listed in the report. The main ones:
 - `pi05.so` for Python 3.13, where ActQuant's server uses 3.11;
 - a runtime built in CI rather than on the GPU host.
 
-For the later LIBERO client, install Python 3.8 with `uv python install 3.8`
-instead of conda, and run `apt-get update` before any apt install.
+## LIBERO rollouts
+
+`notebooks/03_libero_rollout.py` runs closed-loop LIBERO episodes of the
+released 3-bit checkpoint the way ActQuant evaluates it. ActQuant's
+`tools/pi0.5/serve_policy.py` wraps the `pi05.so` binding in a WebSocket
+policy server, and openpi's `examples/libero/main.py` drives the LIBERO
+simulator as its client. Both files run unmodified. They are fetched at pinned
+commits (ActQuant `b647911`, openpi `215abfb`) and checked against pinned
+SHA-256 digests in `scripts/libero_rollout.py`.
+
+1. Attach the GPU, open the **Server** preview, and install `huggingface_hub`
+   from the Packages panel. Molab ships `uv`; install it there only if the
+   notebook reports it missing.
+2. Choose stages, suites and trials per task, then click **Run LIBERO
+   rollout**. Start with one trial per task on `libero_spatial` (10 episodes).
+3. Download the run ZIP. It holds `report.json`, `episodes.jsonl` (one line
+   per episode), the client and server logs, the render-probe frame, the first
+   image the server received, and `main.py`'s replay videos.
+
+| Stage | What it does |
+| --- | --- |
+| `runtime` | Runs `actquant_build.py --stages toolkit fetch download`: the CUDA runtime, the pinned package and the checkpoint, reusing the work folder |
+| `client` | Installs Python 3.8 with uv and `requirements/libero-client.txt` without dependency resolution. Fetches LIBERO at openpi's submodule commit (`f78abd6`) and writes its config file, which LIBERO otherwise asks for on stdin. Renders one `libero_spatial` scene with EGL, then Mesa EGL, then OSMesa; if none works it installs Mesa with apt and tries again |
+| `server` | Creates a venv for the Python `pi05.so` was built for, with `requirements/libero-server.txt`. Starts `serve_policy.py` on `CUDA0` with 10 flow steps, as `run_libero_eval.sh` does, and sends three observations over the openpi protocol |
+| `rollout` | Starts the server and runs `main.py` once per suite with `--args.port`, 5 replan steps and seed 7. Records every episode |
+
+**Validity.** `serve_policy.py` answers a failed inference with zero actions,
+which it then unnormalizes, so the client cannot tell them from real ones. The
+script watches the server log during the rollout. Any `Inference failed`
+line, handler error or missing normalization stats, or a server exit, stops
+the run. A suite is valid only if none of those happened, no episode ended in
+a client exception, and every expected episode finished. Success rates come
+with a 95% Wilson interval and ActQuant's reported rate for 500 trials
+(`libero_spatial` 98.2%, `libero_object` 98.8%, `libero_goal` 95.0%,
+`libero_10` 87.2%).
+
+**Client environment.** `requirements/libero-client.in` lists the client's
+direct requirements. It is locked for Python 3.8 with openpi's
+`examples/libero/requirements.txt` as constraints, so openpi's versions are
+kept, with these exceptions:
+- torch 2.4.1 CPU instead of 1.11.0 cu113. LIBERO only uses torch to load its
+  init states, and glibc 2.41 or newer refuses to load 1.11's
+  `libtorch_cpu.so`, which requests an executable stack.
+- `opencv-python-headless` instead of `opencv-python`, which needs libGL.
+- robosuite's keyboard teleoperation packages (`pynput`, `evdev`,
+  `python-xlib`) are left out; `evdev` has no wheels.
+- Only LIBERO's runtime requirements are installed, not its training ones.
+
+Other deviations the report records:
+- the server runs in a Python 3.13 venv instead of openpi's 3.11;
+- a single server on one GPU, where ActQuant's launcher shards tasks across
+  one server per GPU;
+- fewer than 50 trials per task, when chosen;
+- the rendering backend, if it is not EGL.
+
+A full suite at 50 trials per task is 500 episodes and takes hours. Molab
+resets sandboxes that run long jobs, and a reset wipes the work folder and
+the run, so run suites in pieces and download each ZIP.
 
 Molab documentation: [GitHub mirroring and server previews](https://docs.marimo.io/guides/molab/#mirror-notebooks-from-github),
 [GPU and session limits](https://docs.marimo.io/guides/molab/#compute), and

@@ -1,0 +1,6 @@
+# Keyboard teleoperation only (robosuite.devices); evdev has no wheels and needs a compiler.
+pynput
+evdev
+python-xlib
+# Replaced by opencv-python-headless.
+opencv-python

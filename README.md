@@ -49,7 +49,10 @@ policy or benchmark. ActQuant's Pi 0.5 runtime is compiled by
 [a GitHub Actions workflow](.github/workflows/actquant-build.yml) in a
 Molab-matching container and published as a release. [The ActQuant runtime
 notebook](notebooks/02_actquant_build.py) fetches that pinned package, downloads
-the released 3-bit checkpoint, and runs one CUDA inference as a smoke test. The earlier [Kaggle preflight](docs/kaggle.md) remains
+the released 3-bit checkpoint, and runs one CUDA inference as a smoke test. [The LIBERO rollout
+notebook](notebooks/03_libero_rollout.py) then evaluates that checkpoint in
+closed loop, through ActQuant's policy server and openpi's LIBERO client, both
+unmodified. The earlier [Kaggle preflight](docs/kaggle.md) remains
 available as an alternative.
 
 ## Experimental approach

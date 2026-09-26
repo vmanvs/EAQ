@@ -1,0 +1,5 @@
+# Locked from libero-server.in (see the command there) for Python 3.13 on x86_64 Linux.
+msgpack==1.2.2
+numpy==2.5.3
+opencv-python-headless==5.0.0.93
+websockets==17.1
