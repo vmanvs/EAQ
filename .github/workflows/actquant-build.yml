@@ -78,10 +78,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: actquant-build-${{ github.run_number }}
-          # The unpacked package folder duplicates the tarball.
-          path: |
-            out/
-            !out/package/*/**
+          path: out/
           retention-days: 30
           if-no-files-found: warn
 

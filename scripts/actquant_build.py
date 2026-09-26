@@ -441,10 +441,10 @@ class Builder:
 
     @property
     def _suffix(self):
-        # One tree per architecture, toolkit version and VMM setting: CMake cannot switch compilers in place.
+        # One tree per architecture, toolkit version and option set: CMake cannot switch compilers in place.
         version = (self.toolkit or {}).get("version") or "none"
         return (f"sm{self.arch}-cu{version}" + ("-novmm" if self.args.no_vmm else "")
-                + ("-nofa" if self.args.no_flash_attn else ""))
+                + ("-nofa" if self.args.no_flash_attn else "") + ("-portable" if self.args.no_gpu else ""))
 
     @property
     def build_dir(self):
@@ -753,7 +753,10 @@ class Builder:
                 "-DLLAMA_CURL=OFF",
                 f"-DPython_EXECUTABLE={sys.executable}",
                 *(["-DGGML_CUDA_NO_VMM=ON"] if self.args.no_vmm else []),
-                *(["-DGGML_CUDA_FA=OFF"] if self.args.no_flash_attn else [])]
+                *(["-DGGML_CUDA_FA=OFF"] if self.args.no_flash_attn else []),
+                # Without a GPU this is not the target host, so -march=native could emit instructions
+                # the target CPU lacks; GGML_NATIVE=OFF targets ggml's portable AVX2 baseline.
+                *(["-DGGML_NATIVE=OFF"] if self.args.no_gpu else [])]
         log_path = self.output / "configure.log"
         attempts = []
         result = _stream([*base, f"-DBUILD_PI05_PYTHON={'ON' if binding else 'OFF'}"], log_path,
@@ -783,6 +786,9 @@ class Builder:
                                "headers are not assumed.")
         if self.args.no_vmm:
             self.deviation("vmm", "GGML_CUDA_NO_VMM=ON: CUDA virtual memory management disabled.")
+        if self.args.no_gpu:
+            self.deviation("native", "GGML_NATIVE=OFF: ggml's CPU code built for a portable AVX2 baseline "
+                                     "instead of -march=native, since the build host is not the target.")
         if self.args.no_flash_attn:
             self.deviation("flash_attn", "GGML_CUDA_FA=OFF: ggml's FlashAttention CUDA kernels compiled as "
                            "stubs to shorten the build (tools/pi0.5 never calls ggml_flash_attn_ext).")
@@ -878,7 +884,8 @@ class Builder:
             raise StageError(f"{binary_dir / 'pi05'} does not exist; run the build stage.")
         toolkit = self._require_toolkit()
         name = self.package_name
-        staging = self.output / "package" / name
+        # Staged in the work folder so the output (uploaded by CI) holds only the tarball.
+        staging = self.work / "package-staging" / name
         if staging.exists():
             shutil.rmtree(staging)
         (staging / "bin").mkdir(parents=True)
@@ -923,6 +930,7 @@ class Builder:
         }
         (staging / "eaq-package.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         tarball = self.output / "package" / f"{name}.tar.gz"
+        tarball.parent.mkdir(parents=True, exist_ok=True)
         with tarfile.open(tarball, "w:gz") as archive:
             archive.add(staging, arcname=name)
         digest = self._sha256(tarball)

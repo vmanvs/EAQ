@@ -140,6 +140,8 @@ binaries and the `pi05.so` binding load there. It then runs
 - **No VMM:** `--no-vmm` (`GGML_CUDA_NO_VMM=ON`). ggml links the CUDA driver
   library only for virtual memory management, and the runner has no driver.
   ggml then allocates GPU memory without VMM.
+- **Portable CPU code:** with `--no-gpu` the script also sets `GGML_NATIVE=OFF`,
+  so ggml's CPU code targets a portable AVX2 baseline rather than the runner's CPU.
 - **FlashAttention stubs:** `--no-flash-attn` (`GGML_CUDA_FA=OFF`, a workflow
   input, on by default) compiles ggml's FlashAttention CUDA kernels as stubs.
   ActQuant's `tools/pi0.5` never calls `ggml_flash_attn_ext`.
@@ -196,6 +198,7 @@ are all listed in the report. The main ones:
 - sm_120 device code only;
 - `LLAMA_CURL=OFF`;
 - `GGML_CUDA_NO_VMM=ON`;
+- `GGML_NATIVE=OFF`;
 - FlashAttention stubs;
 - `pi05.so` for Python 3.13, where ActQuant's server uses 3.11;
 - a runtime built in CI rather than on the GPU host.
