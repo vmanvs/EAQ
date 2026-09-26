@@ -262,9 +262,9 @@ def _(mo):
     )
     cpu_check = mo.ui.checkbox(label="Also run the CLI on CPU and compare with CUDA (slower)")
     build_jobs = mo.ui.dropdown(
-        options=["auto", "1", "2", "4", "6", "8"],
+        options=["auto", "1", "2", "3", "4"],
         value="auto",
-        label="Parallel build jobs (auto: 4, sized for Molab's 4 CPUs and 32 GiB)",
+        label="Parallel build jobs (auto: 2, leaving 2 of Molab's 4 CPUs for the notebook)",
     )
     run_build = mo.ui.run_button(
         label="Run ActQuant build",
@@ -429,13 +429,18 @@ def _(
                 _elapsed_text = "unknown time"
             _stage = next((name for name, entry in ((_report or {}).get("stages") or {}).items()
                            if entry.get("status") == "running"), "starting")
-            _memory_lines = _log_tail(_run_dir / "memory.log", lines=1)
-            _memory = json.loads(_memory_lines) if _memory_lines.startswith("{") else {}
-            _memory_text = (f"; memory in use {_memory.get('processes_rss_gib')} GiB of 32, "
-                            f"{_memory.get('available_gib')} GiB reported available" if _memory else "")
+            _samples = [json.loads(_line) for _line in
+                        _log_tail(_run_dir / "resources.log", lines=8).splitlines() if _line.startswith("{")]
+            _now = _samples[-1] if _samples else {}
+            _files = next((_sample for _sample in reversed(_samples) if "tmp_files_gib" in _sample), {})
+            _resources_text = (
+                f"\n\nResources at {_now.get('time')}: load {_now.get('load_1min')} on 4 CPUs, "
+                f"{_now.get('processes')} processes, {_now.get('processes_rss_gib')} GiB resident, "
+                f"{_now.get('cached_gib')} GiB cached; files in /tmp {_files.get('tmp_files_gib')} GiB, "
+                f"in ~/.cache {_files.get('cache_files_gib')} GiB" if _now else "")
             _items.append(mo.md(
-                f"**Running** run `{_last['run_id']}`: stage `{_stage}`, started {_elapsed_text} ago"
-                f"{_memory_text}.\n\n```text\n{_log_tail(_run_dir / 'notebook.log')}\n```"
+                f"**Running** run `{_last['run_id']}`: stage `{_stage}`, started {_elapsed_text} ago."
+                f"{_resources_text}\n\n```text\n{_log_tail(_run_dir / 'notebook.log')}\n```"
             ))
             _items.append(_download)
         else:
@@ -469,7 +474,7 @@ def _(
                 if _status == "interrupted":
                     _items.append(mo.md(
                         "The run was killed without finishing; the table shows the stage it was in. "
-                        "`memory.log` in the ZIP shows whether memory use was near the 32 GiB limit. "
+                        "`resources.log` in the ZIP shows memory, load and file sizes until then. "
                         "Rerun to continue: the build resumes where it stopped if the work folder "
                         "survived.\n\n```text\n" + _log_tail(_run_dir / "notebook.log") + "\n```"
                     ))

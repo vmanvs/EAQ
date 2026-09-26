@@ -84,10 +84,12 @@ int main() {
 """
 TIMEOUTS = {"configure": 15 * 60, "build": 3 * 60 * 60, "infer": 20 * 60}
 # Molab gives each notebook 4 CPUs and 32 GiB, but its sandbox reports the host's 20 CPUs and
-# 160 GiB, and the controller ends the session when the limit is exceeded. More compile jobs than
-# CPUs gains nothing, and 4 jobs at up to 4 GiB each stays well inside 32 GiB.
-DEFAULT_MAX_JOBS = 4
+# 160 GiB. Builds using all 4 CPUs (or more jobs) lost the notebook connection within minutes
+# while using little memory, so the default leaves two CPUs for the notebook server and the
+# sandbox, and the build runs at low priority.
+DEFAULT_MAX_JOBS = 2
 GIB_PER_JOB = 4
+BUILD_NICENESS = 10
 
 
 class StageError(RuntimeError):
@@ -124,25 +126,55 @@ def _read_bytes_value(path):
     return int(text) if text.isdigit() and int(text) < 2**60 else None
 
 
-def memory_sample():
-    """Memory in GiB: available per /proc/meminfo, the resident total of all visible processes
-    (what a per-notebook limit counts), and the cgroup's usage and limit when exposed."""
+def _meminfo():
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            return {key: int(value.split()[0]) for key, value in
+                    (line.split(":", 1) for line in handle if ":" in line)}
+    except (OSError, ValueError, IndexError):
+        return {}
+
+
+def _tree_gib(root):
+    """Total size of the files under root, without following links; None if missing."""
+    if not os.path.isdir(root):
+        return None
+    total = 0
+    for folder, _, files in os.walk(root, onerror=lambda error: None):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(folder, name)).st_size
+            except OSError:
+                pass
+    return round(total / 2**30, 2)
+
+
+def resource_sample(with_files=False):
+    """What might end a sandboxed session, in GiB: resident memory of all visible processes, the
+    kernel's memory counters (in gVisor, files in the sandbox filesystem can be held in memory),
+    load average and process count, cgroup usage and limit when exposed, and optionally the size
+    of the scratch folders."""
     sample = {}
     if os.path.isdir("/proc"):
-        pages = 0
+        pages, processes = 0, 0
         for statm in glob.glob("/proc/[0-9]*/statm"):
             try:
                 with open(statm, encoding="utf-8") as handle:
                     pages += int(handle.read().split()[1])
+                processes += 1
             except (OSError, ValueError, IndexError):
                 pass
+        sample["processes"] = processes
         sample["processes_rss_gib"] = round(pages * os.sysconf("SC_PAGE_SIZE") / 2**30, 1)
-    try:
-        with open("/proc/meminfo", encoding="utf-8") as handle:
-            fields = dict(line.split(":", 1) for line in handle if ":" in line)
-        sample["available_gib"] = round(int(fields["MemAvailable"].split()[0]) / 2**20, 1)
-    except (OSError, KeyError, ValueError):
-        pass
+        try:
+            sample["load_1min"] = float(Path("/proc/loadavg").read_text(encoding="utf-8").split()[0])
+        except (OSError, ValueError, IndexError):
+            pass
+    meminfo = _meminfo()
+    for field, key in (("MemAvailable", "available_gib"), ("MemFree", "free_gib"),
+                       ("Cached", "cached_gib"), ("Shmem", "shmem_gib"), ("AnonPages", "anon_gib")):
+        if field in meminfo:
+            sample[key] = round(meminfo[field] / 2**20, 1)
     for key, paths in (("cgroup_used_gib", ("/sys/fs/cgroup/memory.current",
                                             "/sys/fs/cgroup/memory/memory.usage_in_bytes")),
                        ("cgroup_limit_gib", ("/sys/fs/cgroup/memory.max",
@@ -152,17 +184,19 @@ def memory_sample():
             if value is not None:
                 sample[key] = round(value / 2**30, 1)
                 break
+    if with_files:
+        sample["tmp_files_gib"] = _tree_gib(tempfile.gettempdir())
+        sample["cache_files_gib"] = _tree_gib(os.path.expanduser("~/.cache"))
     return sample
 
 
-class MemoryWatch:
-    """Log memory every few seconds during a long stage, to tell out-of-memory kills from disconnects."""
+class ResourceWatch:
+    """Log resources every few seconds during a long stage, so a killed session leaves evidence."""
 
-    def __init__(self, log_path, interval=15, low_gib=8.0, high_rss_gib=24.0):
-        self.log_path, self.interval, self.low_gib, self.high_rss_gib = log_path, interval, low_gib, high_rss_gib
-        self.min_available = None
-        self.max_cgroup_used = None
-        self.max_rss = None
+    def __init__(self, log_path, interval=15, files_every=4, high_rss_gib=24.0):
+        self.log_path, self.interval, self.files_every = log_path, interval, files_every
+        self.high_rss_gib = high_rss_gib
+        self.peaks = {}
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
@@ -172,32 +206,33 @@ class MemoryWatch:
 
     def __exit__(self, *exc):
         self._stop.set()
-        self._thread.join(timeout=30)
+        self._thread.join(timeout=60)
 
     def _loop(self):
-        last_warning = 0.0
+        last_warning, count = 0.0, 0
         with open(self.log_path, "a", encoding="utf-8") as handle:
-            while not self._stop.wait(self.interval):
-                sample = memory_sample()
+            while True:
+                sample = resource_sample(with_files=count % self.files_every == 0)
+                count += 1
                 handle.write(json.dumps({"time": dt.datetime.now().strftime("%H:%M:%S"), **sample}) + "\n")
                 handle.flush()
-                available, rss = sample.get("available_gib"), sample.get("processes_rss_gib")
-                if available is not None:
-                    self.min_available = min(available, self.min_available if self.min_available is not None
-                                             else available)
-                if rss is not None:
-                    self.max_rss = max(rss, self.max_rss or 0.0)
-                if ((available is not None and available < self.low_gib)
-                        or (rss is not None and rss > self.high_rss_gib)) and time.monotonic() - last_warning > 60:
+                for key in ("processes_rss_gib", "load_1min", "processes", "cached_gib", "shmem_gib",
+                            "tmp_files_gib", "cgroup_used_gib"):
+                    if sample.get(key) is not None:
+                        self.peaks[key] = max(sample[key], self.peaks.get(key, sample[key]))
+                if "available_gib" in sample:
+                    self.peaks["min_available_gib"] = min(sample["available_gib"],
+                                                          self.peaks.get("min_available_gib", sample["available_gib"]))
+                rss = sample.get("processes_rss_gib")
+                if rss is not None and rss > self.high_rss_gib and time.monotonic() - last_warning > 60:
                     last_warning = time.monotonic()
-                    log(f"high memory use: {rss} GiB resident in all processes, {available} GiB available")
-                if "cgroup_used_gib" in sample:
-                    self.max_cgroup_used = max(sample["cgroup_used_gib"], self.max_cgroup_used or 0.0)
+                    log(f"high memory use: {rss} GiB resident in all processes")
+                if self._stop.wait(self.interval):
+                    break
 
     @property
     def summary(self):
-        return {"min_available_gib": self.min_available, "max_processes_rss_gib": self.max_rss,
-                "max_cgroup_used_gib": self.max_cgroup_used, "log": self.log_path.name}
+        return {"peaks": self.peaks, "log": self.log_path.name}
 
 
 def cpu_quota():
@@ -401,7 +436,7 @@ class Builder:
             memory = {key: round(int(fields[key].split()[0]) / 2**20, 1) for key in ("MemTotal", "MemAvailable")}
         except (OSError, KeyError, ValueError):
             pass
-        if memory is not None and "cgroup_limit_gib" in (sample := memory_sample()):
+        if memory is not None and "cgroup_limit_gib" in (sample := resource_sample()):
             memory["cgroup_limit_gib"] = sample["cgroup_limit_gib"]
         try:
             usage = shutil.disk_usage(self.work.parent if not self.work.exists() else self.work)
@@ -471,6 +506,11 @@ class Builder:
             self.save()
             (self.output / "exit_code").write_text("1\n", encoding="utf-8")
             return 1
+        # Low priority, so the notebook server keeps getting CPU time (children inherit it).
+        try:
+            self.report["niceness"] = os.nice(BUILD_NICENESS)
+        except (AttributeError, OSError):
+            self.report["niceness"] = None
         requested = [stage for stage in STAGES if stage in self.args.stages]
         failed = None
         # "running" stays in report.json if the process is killed, showing where it stopped.
@@ -702,7 +742,8 @@ class Builder:
         if self.args.jobs:
             return self.args.jobs
         host = self.report["host"]
-        cpus = int(host["cpu_quota"] or host["cpus"] or DEFAULT_MAX_JOBS)
+        # The reported CPU count is the host's; the cgroup quota, when visible, is the real one.
+        cpus = max(1, int(host["cpu_quota"] or host["cpus"] or DEFAULT_MAX_JOBS) - 2)
         memory = host["memory_gib"] or {}
         budgets = [value for value in (memory.get("MemAvailable"), memory.get("cgroup_limit_gib")) if value]
         # CUDA template instances take 2-4 GiB each to compile.
@@ -718,11 +759,12 @@ class Builder:
         targets = [*BUILD_TARGETS, *(["pi05_py"] if binding else [])]
         jobs = self._jobs()
         log(f"building {', '.join(targets)} with {jobs} parallel jobs; the first build takes a while")
-        with MemoryWatch(self.output / "memory.log") as memory:
+        with ResourceWatch(self.output / "resources.log") as resources:
             result = _stream([cmake, "--build", self.build_dir, "--target", *targets, "-j", str(jobs)],
                              self.output / "build.log", self.args.build_timeout)
-        details = {"targets": targets, "jobs": jobs, "returncode": result["returncode"],
-                   "build_seconds": result["seconds"], "memory": memory.summary}
+        details = {"targets": targets, "jobs": jobs, "niceness": self.report.get("niceness"),
+                   "returncode": result["returncode"], "build_seconds": result["seconds"],
+                   "resources": resources.summary}
         if result["timed_out"]:
             raise StageError(f"Build timed out after {self.args.build_timeout} s; rerun to continue "
                              "(the build is incremental).", {**details, "tail": result["tail"][-4000:]})
@@ -914,7 +956,7 @@ def main():
                         default=Path(__file__).resolve().parents[1] / "requirements" / "actquant-cuda-toolkit.txt",
                         help="Pinned CUDA toolkit wheels installed by the toolkit stage.")
     parser.add_argument("--cuda-arch", help="Override the GPU architecture, e.g. 120.")
-    parser.add_argument("--jobs", type=int, help=f"Parallel build jobs (default: CPUs, limited by memory, at most {DEFAULT_MAX_JOBS}).")
+    parser.add_argument("--jobs", type=int, help=f"Parallel build jobs (default: CPUs minus 2, limited by memory, at most {DEFAULT_MAX_JOBS}).")
     parser.add_argument("--no-vmm", action="store_true", help="Build with GGML_CUDA_NO_VMM=ON.")
     parser.add_argument("--no-binding", action="store_true", help="Do not build the pi05.so Python binding.")
     parser.add_argument("--cpu-check", action="store_true", help="Also run the CLI on CPU and compare.")

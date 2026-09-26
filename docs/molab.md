@@ -83,7 +83,7 @@ Observed on 2026-09-25 (EAQ commit `1ad08ef`); verdict
 | --- | --- |
 | GPU | NVIDIA RTX PRO 6000 Blackwell Server Edition, 95 GiB, compute capability 12.0 (sm_120) |
 | Driver | 595.71.05, supporting CUDA 13.2 |
-| Host | gVisor sandbox, Debian 13, glibc 2.41, root with apt. The sandbox reports 20 CPUs and 160 GiB, but Molab allots each notebook 4 CPUs and 32 GiB and ends the session when that is exceeded |
+| Host | gVisor sandbox, Debian 13, glibc 2.41, root with apt. The sandbox reports 20 CPUs and 160 GiB, but Molab's documentation allots each notebook 4 CPUs and 32 GiB |
 | Python | 3.13; PyTorch 2.11.0 built for CUDA 13.0 |
 | CUDA toolkit | No system toolkit. Pip packages install a mixed toolkit under `site-packages/nvidia/cu13`: nvcc 13.3 with the 13.0 runtime headers PyTorch pins |
 | Disk | Not measurable: the sandbox reports a placeholder size |
@@ -134,7 +134,7 @@ notebook below.
 
 Open questions: whether ActQuant's own ggml kernels build and run under this
 setup (with the pinned 13.0 toolkit a build reached 232 of 234 steps before the
-session ended, probably at the 32 GiB limit), real scratch-disk capacity, and whether long policy-server rollouts fit
+notebook connection was lost; the cause is not yet known), real scratch-disk capacity, and whether long policy-server rollouts fit
 Molab's [usage restrictions](https://molab.marimo.io/pages/molab/restrictions)
 and 12-hour session limit.
 
@@ -161,13 +161,20 @@ run's ZIP can be downloaded at any time; while the build is running it is a
 snapshot of the logs so far. A lock on the work folder prevents a second
 build from starting while one is running.
 
-Early builds ran 20 and then 8 compile jobs, sized from the 20 CPUs and
-160 GiB that the sandbox reports. Those runs were cut off during the build,
-at up to 232 of 234 steps. The default is now 4 jobs, matching the notebook's
-real 4 CPUs and keeping peak memory well below 32 GiB; the notebook's jobs
-setting overrides it. During the build, `memory.log` records every 15 seconds
-the resident memory of all processes (what the 32 GiB limit counts) and the
-available memory reported by the sandbox, and the log warns above 24 GiB.
+Every build so far lost the notebook connection partway through, at 20, 8
+and 4 parallel jobs. At 4 jobs this happened within minutes, with only about
+1 GiB of process memory in use. The cause is not established. Two suspects:
+- CPU starvation: the sandbox reports 20 CPUs, but each notebook gets 4, and
+  saturating them may starve the notebook server and the sandbox.
+- Memory held by files: gVisor can keep files written to its filesystem in
+  memory, and the process figures do not show that memory.
+
+The build therefore runs 2 jobs by default at low priority (nice 10); the
+notebook's jobs setting overrides this. During the build, `resources.log`
+records every 15 seconds the load average, the process count, the resident
+memory of all processes, and the kernel's cached and shared memory. Every
+minute it also records the size of the files in `/tmp` and `~/.cache`. The
+status cell shows the latest values.
 
 | Stage | What it does |
 | --- | --- |
