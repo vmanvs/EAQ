@@ -1067,8 +1067,11 @@ class Builder:
         matches = re.findall(r"min:\s*(\S+),\s*max:\s*(\S+),\s*mean:\s*(\S+)", output)
         if matches:
             parsed["stats"] = {key: float(value) for key, value in zip(("min", "max", "mean"), matches[-1])}
-        match = re.search(r"using (\S+) backend", output)
-        parsed["backend"] = match[1] if match else None
+        # Pi05 default-constructs its vision encoder, projector and action expert (CPU contexts)
+        # before replacing them with ones on the requested device, so the last line is the live one.
+        backends = re.findall(r"create_backend: using (\S+) backend", output)
+        parsed["backends"] = backends
+        parsed["backend"] = backends[-1] if backends else None
         match = re.search(r"Output actions \((\d+) dim x (\d+) horizon", output)
         if match:
             parsed["action_dim"], parsed["action_horizon"] = int(match[1]), int(match[2])
