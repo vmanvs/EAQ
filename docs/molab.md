@@ -112,99 +112,96 @@ Five behaviours shaped the recipe below:
   search. Linking needs unversioned `lib*.so` links, and running needs an
   RPATH or `LD_LIBRARY_PATH`.
 
-## ActQuant build recipe for Molab
+## ActQuant runtime
 
-Derived from the preflight and the first build, and applied by the build
-notebook below.
+ActQuant's Pi 0.5 runtime is compiled in GitHub Actions and only run on
+Molab. Compiling it in a Molab notebook failed repeatedly. Every attempt,
+with 2 to 20 parallel jobs, ended with the whole sandbox reset partway
+through, within a few minutes of starting. Memory stayed low throughout: 3–5 GiB
+resident and about 2 GiB of files. Molab does not document a cause. Its
+[restrictions](https://molab.marimo.io/pages/molab/restrictions) allow
+terminating notebooks used for "non-interactive jobs", and a long compile
+launched from one button resembles such a job. Repeated terminations also risk
+the account, so heavy compiles stay off Molab.
 
-1. Install `cmake` and `ninja` from the Packages panel.
-2. Install the CUDA 13.0 wheels pinned in `requirements/actquant-cuda-toolkit.txt`
-   with `--target` into a private folder, and use
-   `TOOLKIT=<folder>/nvidia/cu13`. This leaves PyTorch's environment
-   untouched, and the toolkit is not newer than the driver (13.2).
-3. Create unversioned links for `$TOOLKIT/lib/lib*.so.*` in a scratch folder
-   and pass it as `-DCMAKE_LIBRARY_PATH`.
-4. Configure with `-G Ninja -DCMAKE_CUDA_COMPILER=$TOOLKIT/bin/nvcc
-   -DCUDAToolkit_ROOT=$TOOLKIT -DCMAKE_CUDA_ARCHITECTURES=120
-   -DCMAKE_BUILD_RPATH=$TOOLKIT/lib`.
-5. Use uv instead of conda. Install Python 3.8 for the LIBERO client with
-   `uv python install 3.8`. Run `apt-get update` before any apt install.
-6. Record each item above as a deviation from ActQuant's documented setup
-   (Ubuntu 22.04, CUDA 12.6, conda).
+### Building the package (GitHub Actions)
 
-Open questions: whether ActQuant's own ggml kernels build and run under this
-setup (with the pinned 13.0 toolkit a build reached 232 of 234 steps before the
-notebook connection was lost; the cause is not yet known), real scratch-disk capacity, and whether long policy-server rollouts fit
-Molab's [usage restrictions](https://molab.marimo.io/pages/molab/restrictions)
-and 12-hour session limit.
+The **ActQuant build** workflow (`.github/workflows/actquant-build.yml`) is
+started by hand from the repository's **Actions** tab. It runs on a free
+GitHub-hosted runner, in a `python:3.13-slim-trixie` container. That image
+matches Molab's Debian 13, glibc 2.41, gcc 14 and Python 3.13, so the
+binaries and the `pi05.so` binding load there. It then runs
+`scripts/actquant_build.py` with these settings:
 
-## Building ActQuant
+- **Toolkit:** the private CUDA 13.0 toolkit from the wheels pinned in
+  `requirements/actquant-cuda-toolkit.txt`.
+- **No GPU on the runner:** `--no-gpu --cuda-arch 120`. The toolkit probe is
+  compiled but not run.
+- **No VMM:** `--no-vmm` (`GGML_CUDA_NO_VMM=ON`). ggml links the CUDA driver
+  library only for virtual memory management, and the runner has no driver.
+  ggml then allocates GPU memory without VMM.
+- **FlashAttention stubs:** `--no-flash-attn` (`GGML_CUDA_FA=OFF`, a workflow
+  input, on by default) compiles ggml's FlashAttention CUDA kernels as stubs.
+  ActQuant's `tools/pi0.5` never calls `ggml_flash_attn_ext`.
+- **Package:** the `package` stage collects `pi05`, `llama-quantize`,
+  `pi05.so` and the ggml/llama libraries. It sets their RUNPATH to
+  `$ORIGIN:$ORIGIN/../cuda/lib` and writes `eaq-package.json` (commits,
+  options, toolchain, deviations, and per-file SHA-256). Then it creates a
+  tarball, installs it and checks with `ldd` that every library resolves.
+- **CPU smoke test:** downloads the checkpoint and runs one CPU inference
+  from the installed package (a workflow input, on by default).
 
-`notebooks/02_actquant_build.py` applies the recipe to ActQuant itself. Like the
-preflight, it fetches its script (`scripts/actquant_build.py`) and pins
-(`requirements/actquant-build.txt`, `requirements/actquant-cuda-toolkit.txt`)
-through the GitHub API.
+A second job publishes the tarball, its `.sha256` and `report.json` as a
+GitHub release. The run summary shows a pin to copy into
+`requirements/actquant-prebuilt.json`. Once the pin is committed, notebook 02
+uses the new package. The fetch stage refuses a download whose SHA-256
+differs from the pin.
 
-1. Attach the GPU, open the **Server** preview, and install `cmake`, `ninja`,
-   `huggingface_hub`, and optionally `pybind11` from the Packages panel. Do
-   not install CUDA packages; the `toolkit` stage installs its own.
-2. Choose stages and click **Run ActQuant build**. Output streams into the
-   notebook while it runs.
+### Running on Molab
+
+`notebooks/02_actquant_build.py` fetches its script and pins through the
+GitHub API, like the preflight.
+
+1. Attach the GPU, open the **Server** preview, and install `huggingface_hub`
+   from the Packages panel. Do not install CUDA packages.
+2. Click **Run ActQuant**. Output streams into the notebook; the run takes a
+   few minutes.
 3. Download the run artifacts before the session ends.
-
-The script runs as a separate process that writes to a log file, not as a
-child tied to the notebook's output. Before this change, every notebook
-disconnect ended the build: its output pipe broke. The status cell refreshes
-itself on a timer instead of blocking the kernel. After a reconnect, it picks
-the run up again, or shows its result if it finished in the meantime. The
-run's ZIP can be downloaded at any time; while the build is running it is a
-snapshot of the logs so far. A lock on the work folder prevents a second
-build from starting while one is running.
-
-Every build so far was cut off by a reset of the whole Molab sandbox: the
-next session started from an empty work folder. Memory was not the cause:
-processes used under 1 GiB and files in `/tmp` and `~/.cache` about 2 GiB.
-Builds with more parallel jobs got further (20 jobs reached step 232 of 234,
-2 jobs about step 51), which suggests a time limit that Molab does not
-document. The build therefore favours speed:
-
-- By default it runs as many jobs as the sandbox reports CPUs, at most 16 and
-  limited by memory, at low priority (nice 10).
-- The **Skip FlashAttention kernels** option, on by default, configures
-  `GGML_CUDA_FA=OFF`. ggml then compiles its FlashAttention CUDA kernels as
-  stubs, which removes most of the compile time of about 55 of the 234 steps.
-  ActQuant's `tools/pi0.5` never calls `ggml_flash_attn_ext`, and the option is
-  recorded as a deviation.
-
-During the build, `resources.log` records every 15 seconds the sandbox's
-uptime (which dates a reset), the process count, the resident memory of all
-processes, and the kernel's cached and shared memory. Every minute it also
-records the size of the files in `/tmp` and `~/.cache`. gVisor does not
-implement the load average. The status cell shows the latest values.
 
 | Stage | What it does |
 | --- | --- |
-| `toolkit` | Installs the pinned CUDA 13.0 wheels (about 0.5 GB) into the work folder. It then checks that nvcc, the runtime headers and CCCL agree and that nvcc is not newer than the driver. It adds a `lib64 → lib` link, because the 13.0 nvcc wheel's `nvcc.profile` expects the system-install layout. Finally it compiles, links and runs a CUB + `cuda_fp16` kernel on the GPU |
-| `source` | Fetches ActQuant at its pinned commit and unpacks `vendor/tokenizers-cpp.zip` |
-| `configure` | Runs CMake with the recipe's flags, `LLAMA_CURL=OFF` and, by default, `GGML_CUDA_FA=OFF`; enables the `pi05.so` binding when `pybind11` and `Python.h` are available, and retries without it otherwise |
-| `build` | Builds `pi05`, `llama-quantize` and, if enabled, `pi05.so`; checks with `ldd` that every library resolves |
+| `toolkit` | Installs the pinned CUDA 13.0 wheels (about 0.5 GB) into the work folder. It checks that nvcc, the runtime headers and CCCL agree, and that nvcc is not newer than the driver (13.2). It adds a `lib64 → lib` link, because the 13.0 nvcc wheel's `nvcc.profile` expects the system-install layout. It then compiles, links and runs a CUB + `cuda_fp16` kernel on the GPU |
+| `fetch` | Downloads the pinned release package, verifies its SHA-256, and unpacks it into the work folder. Links its `cuda` folder to the toolkit and checks with `ldd` that every library resolves. Refuses a package built for another ActQuant commit, GPU architecture or CUDA version. Adds the package's build-time deviations to the report |
 | `download` | Fetches `pi05.gguf`, `tokenizer.model` and `norm_stats.json` of `ActQuant-Pi05-LIBERO-3bpw` at a pinned revision and verifies SHA-256 |
-| `infer` | Runs the `pi05` CLI once on `CUDA0` with a synthetic image and a fixed prompt, and requires finite actions. If the binding was built, it also loads it and runs it twice, for warm latency and repeatability |
+| `infer` | Runs the `pi05` CLI once on `CUDA0` with a synthetic image and a fixed prompt, and requires finite actions. If the package has the binding, it also loads `pi05.so` and runs it twice, for warm latency and repeatability |
 
-Sources, build trees and the checkpoint stay in a work folder (`EAQ_WORK_DIR`,
-default `/tmp/eaq-actquant`) for the session. Stages can be rerun on their
-own, and an interrupted build resumes where it stopped. The run ZIP holds
-`report.json` (stage results, host and toolkit details, and the list of
-deviations from ActQuant's documented setup), `manifest.json`, and the
-configure, build and inference logs. Binaries and weights are not included.
+The toolkit, package and checkpoint stay in a work folder (`EAQ_WORK_DIR`,
+default `/tmp/eaq-actquant`) for the session, so stages can be rerun on their
+own. The script runs as a separate process writing to a log file. The status
+cell refreshes itself and picks a run up again after a reconnect, and the run
+ZIP can be downloaded at any time. The ZIP holds `report.json` (stage results,
+host and toolkit details, and the deviations from ActQuant's documented
+setup), `manifest.json`, and the inference logs. Binaries and weights are not
+included.
 
 The **CPU comparison** option runs the CLI on the CPU as well. The flow's noise
 uses a fixed seed, so the two outputs should be close, though not identical.
-The **no-VMM** option builds a separate tree with `GGML_CUDA_NO_VMM=ON`, in
-case CUDA virtual memory management does not work under gVisor.
 
 The smoke test shows that the runtime executes and produces finite actions on
 this GPU. It is not a LIBERO observation and says nothing about task success.
+
+Deviations from ActQuant's documented setup (Ubuntu 22.04, CUDA 12.6, conda)
+are all listed in the report. The main ones:
+- the pinned pip CUDA 13.0 toolkit;
+- sm_120 device code only;
+- `LLAMA_CURL=OFF`;
+- `GGML_CUDA_NO_VMM=ON`;
+- FlashAttention stubs;
+- `pi05.so` for Python 3.13, where ActQuant's server uses 3.11;
+- a runtime built in CI rather than on the GPU host.
+
+For the later LIBERO client, install Python 3.8 with `uv python install 3.8`
+instead of conda, and run `apt-get update` before any apt install.
 
 Molab documentation: [GitHub mirroring and server previews](https://docs.marimo.io/guides/molab/#mirror-notebooks-from-github),
 [GPU and session limits](https://docs.marimo.io/guides/molab/#compute), and

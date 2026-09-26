@@ -1,28 +1,38 @@
-"""Build ActQuant's Pi 0.5 runtime on a Linux GPU host and run one inference.
+"""Build ActQuant's Pi 0.5 runtime, package it, and run one inference.
 
-Applies the Molab build recipe established by `cloud_preflight.py --only
-actquant`, with one change found by the first build: PyTorch's pip CUDA
-toolkit mixes nvcc 13.3 with 13.0 runtime headers, which CCCL (CUB) rejects,
-so the build uses a private, version-consistent CUDA toolkit installed from
-pinned pip wheels into the work folder. Device code is built for the attached
-GPU only, with unversioned library links and a toolkit RPATH. Stages run in
-order and each writes `report.json`, so a partial run still leaves evidence:
+The runtime is compiled off Molab, in GitHub Actions (Debian 13 and Python
+3.13, as on Molab, but no GPU), and published as a release. Molab only
+fetches that package and runs inference: long compiles in a notebook get
+the Molab sandbox reset. Both sides use this script and the same private,
+version-consistent CUDA toolkit from pinned pip wheels (PyTorch's own pip
+toolkit mixes nvcc 13.3 with 13.0 runtime headers, which CCCL rejects).
+Stages run in order and each writes `report.json`, so a partial run still
+leaves evidence:
 
   toolkit    install the pinned CUDA toolkit wheels into the work folder and
-             check that nvcc, runtime headers and CCCL agree (compiles CUB)
+             check that nvcc, runtime headers and CCCL agree (compiles CUB;
+             runs it too when a GPU is present)
   source     fetch ActQuant at its pinned commit and unpack vendored code
   configure  CMake + Ninja configure of the pi05 runtime
   build      build pi05, llama-quantize and, when possible, the pi05.so binding
+  package    tar the executables and libraries with RUNPATH
+             $ORIGIN:$ORIGIN/../cuda/lib, and install that package locally
+  fetch      download the pinned release package, verify its SHA-256 and
+             install it (the Molab path; replaces source/configure/build/package)
   download   fetch the pinned 3-bit checkpoint and verify its SHA-256
-  infer      one CUDA inference through the CLI (and the binding, if built)
+  infer      one inference through the CLI (and the binding, if present),
+             from the installed package or else the build tree
 
-The work directory keeps sources, build trees and checkpoints between runs in
-one session, so stages can be rerun individually and builds are incremental.
-A lock in the work directory stops two runs from building the same tree; the
-notebook starts this script as a detached process so a disconnected notebook
-does not kill the build.
-This is one self-contained file: Molab fetches it alone and may run Python
-with PYTHONSAFEPATH, which blocks sibling-module imports.
+CI:    --no-gpu --cuda-arch 120 --no-vmm --stages toolkit source configure build
+       package download infer --infer-device CPU
+Molab: --stages toolkit fetch download infer
+
+An installed package is a folder with bin/ and a `cuda` link to the pinned
+toolkit's root, so no LD_LIBRARY_PATH is needed. The work directory keeps
+sources, build trees, packages and checkpoints between runs in one session.
+A lock in the work directory stops two runs from using it at once. This is
+one self-contained file: Molab fetches it alone and may run Python with
+PYTHONSAFEPATH, which blocks sibling-module imports.
 """
 from __future__ import annotations
 
@@ -43,9 +53,12 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import tarfile
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 import zipfile
 
 
@@ -61,7 +74,10 @@ CHECKPOINT_FILES = {
 }
 BUILD_TARGETS = ("pi05", "llama-quantize")
 DEFAULT_PROMPT = "put the black bowl on the plate"
-STAGES = ("toolkit", "source", "configure", "build", "download", "infer")
+STAGES = ("toolkit", "source", "configure", "build", "package", "fetch", "download", "infer")
+PACKAGE_RUNPATH = "$ORIGIN:$ORIGIN/../cuda/lib"
+# Files taken from the build tree's bin/ into a package.
+PACKAGE_FILES = re.compile(r"^(pi05|llama-quantize|pi05\.so|lib[\w.+-]*\.so(\.\d+)*)$")
 # Compiled, linked and run by the toolkit stage, as CMake's compiler check and the build will:
 # build 1 failed in the one ggml file using CUB, build 2 at CMake's link test.
 TOOLKIT_PROBE = """
@@ -82,7 +98,7 @@ int main() {
     return err == cudaSuccess ? 0 : 3;
 }
 """
-TIMEOUTS = {"configure": 15 * 60, "build": 3 * 60 * 60, "infer": 20 * 60}
+TIMEOUTS = {"configure": 15 * 60, "build": 3 * 60 * 60, "infer": 20 * 60, "fetch": 30 * 60}
 # Molab resets the whole sandbox partway through long builds, while memory use stays low; builds
 # with more parallel jobs got further (20 jobs: step 232 of 234; 2 jobs: about 51), which looks
 # like a time budget. So the default favours speed: as many jobs as reported CPUs, limited by
@@ -415,7 +431,8 @@ class Builder:
             "actquant": {"url": ACTQUANT_URL, "commit": ACTQUANT_COMMIT},
             "checkpoint": {"repo": CHECKPOINT_REPO, "revision": CHECKPOINT_REVISION},
             "options": {"stages": args.stages, "cuda_arch": self.arch, "no_vmm": args.no_vmm,
-                        "no_flash_attn": args.no_flash_attn,
+                        "no_flash_attn": args.no_flash_attn, "no_gpu": args.no_gpu,
+                        "infer_device": args.infer_device,
                         "jobs": args.jobs, "cpu_check": args.cpu_check, "prompt": args.prompt,
                         "work_dir": str(self.work)},
             "host": self._host(),
@@ -436,6 +453,22 @@ class Builder:
     @property
     def shim_dir(self):
         return self.work / f"libshim-{self._suffix}"
+
+    @property
+    def package_name(self):
+        return f"actquant-pi05-{self._suffix}-{ACTQUANT_COMMIT[:7]}"
+
+    @property
+    def runtime_bin(self):
+        """bin/ of the installed package (fetch or package stage), else of the build tree."""
+        current = self.work / "prebuilt" / "current.json"
+        try:
+            installed = Path(json.loads(current.read_text(encoding="utf-8"))["path"]) / "bin"
+        except (OSError, ValueError, KeyError):
+            installed = None
+        if installed is not None and (installed / "pi05").is_file():
+            return installed
+        return self.build_dir / "bin"
 
     def _host(self):
         memory = None
@@ -641,11 +674,14 @@ class Builder:
             if result["returncode"] != 0:
                 raise StageError("The pinned toolkit cannot compile and link CUB for this GPU "
                                  "(see probe_build).", details)
-            result = _run([probe_dir / "probe"], timeout=120)
-            details["probe_run"] = {"returncode": result["returncode"], "output": result["output"][-500:]}
-            if result["returncode"] != 0:
-                raise StageError("The probe built by the pinned toolkit does not run on this GPU "
-                                 "(see probe_run).", details)
+            if self.args.no_gpu:
+                details["probe_run"] = "skipped: --no-gpu"
+            else:
+                result = _run([probe_dir / "probe"], timeout=120)
+                details["probe_run"] = {"returncode": result["returncode"], "output": result["output"][-500:]}
+                if result["returncode"] != 0:
+                    raise StageError("The probe built by the pinned toolkit does not run on this GPU "
+                                     "(see probe_run).", details)
         self.deviation("toolkit", f"CUDA toolkit {self.toolkit['version']} from pinned pip wheels in a private "
                                   f"folder ({self.toolkit_prefix}), instead of the system CUDA 12.6 ActQuant "
                                   "documents. PyTorch's own pip toolkit mixes nvcc 13.3 with 13.0 runtime "
@@ -702,6 +738,9 @@ class Builder:
         if not self.arch:
             raise StageError("No GPU compute capability found; attach a GPU or pass --cuda-arch.")
         linked, libcuda = _library_shim(toolkit["root"], self.shim_dir)
+        if libcuda is None and not self.args.no_vmm:
+            raise StageError("The CUDA driver library (libcuda.so.1) was not found, and ggml links it for "
+                             "virtual memory management; pass --no-vmm on hosts without a driver.")
         binding, binding_reasons = self._binding_plan()
         base = [cmake, "-S", self.source, "-B", self.build_dir,
                 *(["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"] if ninja else ["-G", "Unix Makefiles"]),
@@ -797,6 +836,162 @@ class Builder:
                              details)
         return details
 
+    def _install_package(self, tarball, name):
+        """Unpack a package into work/prebuilt/<name>, link its `cuda` folder to the pinned toolkit,
+        check that every library resolves, and make it the runtime used by the infer stage."""
+        toolkit = self._require_toolkit()
+        root = self.work / "prebuilt"
+        target = root / name
+        if target.exists():
+            shutil.rmtree(target)
+        root.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(tarball) as archive:
+            names = archive.getnames()
+            if not names or any(member.split("/")[0] != name for member in names):
+                raise StageError(f"{Path(tarball).name} does not contain a single {name}/ folder.")
+            archive.extractall(root, filter="data")
+        (target / "cuda").symlink_to(toolkit["root"], target_is_directory=True)
+        try:
+            manifest = json.loads((target / "eaq-package.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise StageError(f"The package has no readable eaq-package.json ({type(exc).__name__}).")
+        libraries, unresolved = {}, []
+        for binary in ("pi05", "pi05.so"):
+            if (target / "bin" / binary).is_file():
+                output = _run(["ldd", target / "bin" / binary], timeout=60)["output"]
+                libraries[binary] = [line.strip() for line in output.splitlines()
+                                     if re.search(r"cuda|cublas|ggml|llama|gomp|stdc\+\+|not found", line)]
+                unresolved += [f"{binary}: {line.strip()}" for line in output.splitlines() if "not found" in line]
+        details = {"path": str(target), "libraries": libraries}
+        if unresolved:
+            raise StageError("Libraries in the package do not resolve: " + "; ".join(unresolved), details)
+        (root / "current.json").write_text(json.dumps({"name": name, "path": str(target)}) + "\n",
+                                           encoding="utf-8")
+        return details, manifest
+
+    def stage_package(self):
+        patchelf = _which("patchelf")
+        if not patchelf:
+            raise StageError("patchelf is not installed; it sets the package's RUNPATH.")
+        binary_dir = self.build_dir / "bin"
+        if not (binary_dir / "pi05").is_file():
+            raise StageError(f"{binary_dir / 'pi05'} does not exist; run the build stage.")
+        toolkit = self._require_toolkit()
+        name = self.package_name
+        staging = self.output / "package" / name
+        if staging.exists():
+            shutil.rmtree(staging)
+        (staging / "bin").mkdir(parents=True)
+        files = {}
+        for path in sorted(binary_dir.iterdir()):
+            if not PACKAGE_FILES.match(path.name):
+                continue
+            target = staging / "bin" / path.name
+            if path.is_symlink():
+                target.symlink_to(os.readlink(path))
+                files[path.name] = {"link": os.readlink(path)}
+                continue
+            shutil.copy2(path, target)
+            result = _run([patchelf, "--set-rpath", PACKAGE_RUNPATH, target], timeout=120)
+            if result["returncode"] != 0:
+                raise StageError(f"patchelf failed on {path.name}: {result['output'][-500:]}")
+            files[path.name] = {"bytes": target.stat().st_size, "sha256": self._sha256(target),
+                                "runpath": _run([patchelf, "--print-rpath", target])["output"]}
+        binding = "pi05.so" in files
+        self.deviation("package", "Runtime compiled without a GPU in a Debian 13 / Python 3.13 container "
+                                  "(GitHub Actions) and packaged with RUNPATH "
+                                  f"{PACKAGE_RUNPATH}; `cuda` links to the pinned toolkit at install.")
+        manifest = {
+            "schema_version": 1,
+            "name": name,
+            "built_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "eaq_commit": os.environ.get("GITHUB_SHA"),
+            "eaq_run": (f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
+                        f"{os.environ['GITHUB_RUN_ID']}" if os.environ.get("GITHUB_RUN_ID") else None),
+            "actquant": {"url": ACTQUANT_URL, "commit": ACTQUANT_COMMIT},
+            "cuda_arch": self.arch,
+            "toolkit": {"version": toolkit["version"], "pins": _read_pins(self.args.toolkit_requirements)},
+            "options": {"no_vmm": self.args.no_vmm, "no_flash_attn": self.args.no_flash_attn,
+                        "binding": binding},
+            "python": platform.python_version() if binding else None,
+            "glibc": "-".join(platform.libc_ver()),
+            "compiler": self.report["host"]["tools"].get("gcc"),
+            "layout": f"bin/ holds the executables and libraries, with RUNPATH {PACKAGE_RUNPATH}. Link "
+                      "<package>/cuda to the root of the pinned CUDA toolkit (nvidia/cu13) before use.",
+            "deviations": list(self.deviations.values()),
+            "files": files,
+        }
+        (staging / "eaq-package.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        tarball = self.output / "package" / f"{name}.tar.gz"
+        with tarfile.open(tarball, "w:gz") as archive:
+            archive.add(staging, arcname=name)
+        digest = self._sha256(tarball)
+        (self.output / "package" / f"{name}.tar.gz.sha256").write_text(f"{digest}  {tarball.name}\n",
+                                                                       encoding="utf-8")
+        installed, _ = self._install_package(tarball, name)
+        return {"name": name, "tarball": str(tarball), "bytes": tarball.stat().st_size, "sha256": digest,
+                "files": sorted(files), "binding": binding, "installed": installed}
+
+    def stage_fetch(self):
+        try:
+            pin = json.loads(Path(self.args.prebuilt_pin).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise StageError(f"Cannot read the package pin {self.args.prebuilt_pin} ({type(exc).__name__}).")
+        missing = [key for key in ("repository", "tag", "asset", "sha256") if not pin.get(key)]
+        if missing:
+            raise StageError("No prebuilt package is pinned yet (missing " + ", ".join(missing) + " in "
+                             f"{Path(self.args.prebuilt_pin).name}); run the ActQuant build workflow and "
+                             "copy the pin from its summary.")
+        if not pin["asset"].endswith(".tar.gz"):
+            raise StageError(f"The pinned asset {pin['asset']} is not a .tar.gz package.")
+        name = pin["asset"][:-len(".tar.gz")]
+        url = (f"https://github.com/{pin['repository']}/releases/download/"
+               f"{urllib.parse.quote(pin['tag'])}/{urllib.parse.quote(pin['asset'])}")
+        tarball = self.work / "downloads" / pin["asset"]
+        tarball.parent.mkdir(parents=True, exist_ok=True)
+        details = {"url": url, "sha256_pinned": pin["sha256"]}
+        if not (tarball.is_file() and self._sha256(tarball) == pin["sha256"]):
+            log(f"downloading {pin['asset']}")
+            started = time.monotonic()
+            partial = tarball.with_name(tarball.name + ".part")
+            request = urllib.request.Request(url, headers={"User-Agent": "eaq-actquant-build"})
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response, open(partial, "wb") as handle:
+                    shutil.copyfileobj(response, handle, 16 * 2**20)
+            except OSError as exc:
+                raise StageError(f"Download of {url} failed ({type(exc).__name__}: {exc}).", details)
+            partial.replace(tarball)
+            details["download_seconds"] = round(time.monotonic() - started, 1)
+        digest = self._sha256(tarball)
+        details.update(bytes=tarball.stat().st_size, sha256=digest)
+        if digest != pin["sha256"]:
+            raise StageError(f"Package SHA-256 mismatch: pinned {pin['sha256']}, got {digest}.", details)
+        installed, manifest = self._install_package(tarball, name)
+        details["installed"] = installed
+        details["package"] = {key: manifest.get(key) for key in (
+            "name", "built_utc", "eaq_commit", "eaq_run", "actquant", "cuda_arch", "toolkit", "options",
+            "python", "glibc", "compiler")}
+        problems = []
+        if manifest.get("actquant", {}).get("commit") != ACTQUANT_COMMIT:
+            problems.append(f"package is ActQuant {manifest.get('actquant', {}).get('commit')}, "
+                            f"this script pins {ACTQUANT_COMMIT}")
+        if self.arch and str(manifest.get("cuda_arch")) != str(self.arch):
+            problems.append(f"package is built for sm_{manifest.get('cuda_arch')}, this GPU is sm_{self.arch}")
+        if _version_tuple(manifest.get("toolkit", {}).get("version")) != _version_tuple(self.toolkit["version"]):
+            problems.append(f"package was built with CUDA {manifest.get('toolkit', {}).get('version')}, "
+                            f"the installed runtime is {self.toolkit['version']}")
+        if problems:
+            raise StageError("The pinned package does not match this host: " + "; ".join(problems) + ".", details)
+        python = manifest.get("python")
+        if python and _version_tuple(python) != _version_tuple(platform.python_version()):
+            details["binding_note"] = (f"pi05.so was built for Python {python}; this is "
+                                       f"{platform.python_version()}, so it will not import.")
+        for index, text in enumerate(manifest.get("deviations", [])):
+            self.deviation(f"package_{index}", text)
+        self.deviation("prebuilt", f"Runtime not compiled here: release {pin['tag']} of {pin['repository']}, "
+                                   "built by the EAQ GitHub Actions workflow.")
+        return details
+
     def stage_download(self):
         try:
             from huggingface_hub import HfApi, hf_hub_download
@@ -873,7 +1068,7 @@ class Builder:
         return parsed
 
     def _cli(self, device, image, label):
-        binary = self.build_dir / "bin" / "pi05"
+        binary = self.runtime_bin / "pi05"
         threads = min(8, self.report["host"]["cpus"] or 4)
         result = _stream([binary, "-m", self.checkpoint, "-i", image, "-p", self.args.prompt,
                           "-d", device, "-n", str(threads), "-s", "10"],
@@ -887,27 +1082,32 @@ class Builder:
         return bool(values) and all(math.isfinite(value) for value in values)
 
     def stage_infer(self):
-        binary = self.build_dir / "bin" / "pi05"
+        binary = self.runtime_bin / "pi05"
         if not binary.is_file():
-            raise StageError(f"{binary} does not exist; run the build stage.")
+            raise StageError(f"{binary} does not exist; run the fetch (or build) stage.")
+        device = self.args.infer_device
         missing = [name for name in CHECKPOINT_FILES if not (self.checkpoint / name).is_file()]
         if missing:
             raise StageError(f"Checkpoint files missing ({', '.join(missing)}); run the download stage.")
         image = self._smoke_image()
         self.deviation("smoke", "Smoke-test input is a synthetic 224x224 image and a fixed prompt, "
                                 "not a LIBERO observation; it checks execution, not task behaviour.")
-        details = {"image": image.name, "prompt": self.args.prompt}
-        cuda = self._cli("CUDA0", image, "cuda")
+        details = {"image": image.name, "prompt": self.args.prompt, "runtime": str(self.runtime_bin),
+                   "device": device}
+        label = "cuda" if device.upper().startswith("CUDA") else device.lower()
+        cuda = self._cli(device, image, label)
+        # Stored as cli_cuda whatever the device, so readers of the report find it in one place.
         details["cli_cuda"] = cuda
         problems = []
         if cuda["returncode"] != 0 or not cuda["completed"]:
-            problems.append(f"pi05 CLI exited with {cuda['returncode']} (see infer_cuda.log)")
-        if cuda["backend"] != "CUDA0":
-            problems.append(f"pi05 ran on backend {cuda['backend']!r}, not CUDA0")
+            problems.append(f"pi05 CLI exited with {cuda['returncode']} (see infer_{label}.log)")
+        if cuda["backend"] != device:
+            problems.append(f"pi05 ran on backend {cuda['backend']!r}, not {device}")
         if not self._finite(cuda.get("first_actions", [])) or not self._finite(list(cuda.get("stats", {}).values())):
             problems.append("actions missing or not finite")
 
-        binding_file = next(iter(sorted((self.build_dir / "bin").glob("pi05*.so"))), None)
+        binding_file = self.runtime_bin / "pi05.so"
+        binding_file = binding_file if binding_file.is_file() else None
         if binding_file is not None and not problems:
             details["binding"] = self._binding_run(binding_file, image)
             if details["binding"].get("first") and cuda.get("first_actions"):
@@ -917,7 +1117,7 @@ class Builder:
         elif binding_file is None:
             details["binding"] = {"status": "not built"}
 
-        if self.args.cpu_check and not problems:
+        if self.args.cpu_check and device != "CPU" and not problems:
             cpu = self._cli("CPU", image, "cpu")
             details["cli_cpu"] = cpu
             if cpu.get("first_actions") and cuda.get("first_actions"):
@@ -937,7 +1137,7 @@ import pi05
 t = time.monotonic()
 pipeline = pi05.Pi05Pipeline(model_path={str(self.checkpoint / 'pi05.gguf')!r},
                              tokenizer_path={str(self.checkpoint / 'tokenizer.model')!r},
-                             device_name="CUDA0", n_threads=4, num_flow_steps=10)
+                             device_name={self.args.infer_device!r}, n_threads=4, num_flow_steps=10)
 load = time.monotonic() - t
 runs, times = [], []
 for _ in range(2):
@@ -970,6 +1170,12 @@ def main():
                         default=Path(__file__).resolve().parents[1] / "requirements" / "actquant-cuda-toolkit.txt",
                         help="Pinned CUDA toolkit wheels installed by the toolkit stage.")
     parser.add_argument("--cuda-arch", help="Override the GPU architecture, e.g. 120.")
+    parser.add_argument("--no-gpu", action="store_true",
+                        help="Host has no GPU (CI): needs --cuda-arch; the toolkit probe is built, not run.")
+    parser.add_argument("--prebuilt-pin", type=Path,
+                        default=Path(__file__).resolve().parents[1] / "requirements" / "actquant-prebuilt.json",
+                        help="Release package pinned for the fetch stage.")
+    parser.add_argument("--infer-device", default="CUDA0", help="ggml device for the infer stage (CUDA0 or CPU).")
     parser.add_argument("--jobs", type=int, help=f"Parallel build jobs (default: CPUs, limited by memory, at most {DEFAULT_MAX_JOBS}).")
     parser.add_argument("--no-vmm", action="store_true", help="Build with GGML_CUDA_NO_VMM=ON.")
     parser.add_argument("--no-flash-attn", action="store_true",
@@ -979,6 +1185,8 @@ def main():
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--build-timeout", type=int, default=TIMEOUTS["build"])
     args = parser.parse_args()
+    if args.no_gpu and not args.cuda_arch:
+        parser.error("--no-gpu needs --cuda-arch")
     return Builder(args).run()
 
 

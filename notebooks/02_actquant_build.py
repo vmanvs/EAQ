@@ -41,17 +41,22 @@ def _():
 def _(mo):
     mo.md(
         """
-        # EAQ — ActQuant build on Molab
+        # EAQ — ActQuant runtime on Molab
 
-        Builds [ActQuant](https://github.com/arashakb/ActQuant)'s Pi 0.5 runtime
-        at its pinned commit for the attached GPU, downloads the released 3-bit
-        checkpoint (`ActQuant-Pi05-LIBERO-3bpw`, about 2.4 GB), and runs **one**
-        inference on CUDA. It applies the recipe from the preflight notebook,
-        with one change: PyTorch's pip CUDA toolkit mixes nvcc 13.3 with 13.0
-        runtime headers, which CUB rejects, so the build uses its own pinned
-        CUDA 13.0 toolkit. Device code is built for this GPU only, with
-        unversioned library links and a toolkit RPATH.
-        Every departure from ActQuant's documented setup is listed as a
+        Runs [ActQuant](https://github.com/arashakb/ActQuant)'s Pi 0.5 runtime,
+        at its pinned commit, on the attached GPU: **one** inference with the
+        released 3-bit checkpoint (`ActQuant-Pi05-LIBERO-3bpw`, about 2.4 GB).
+
+        The runtime is **not compiled here**. Long compiles inside Molab got the
+        sandbox reset, and Molab is meant for interactive use. The GitHub
+        Actions workflow `.github/workflows/actquant-build.yml` compiles it for
+        this GPU in a container matching Molab (Debian 13, Python 3.13). It
+        smoke-tests it on CPU and publishes it as a release. This notebook
+        downloads the release pinned in `requirements/actquant-prebuilt.json`,
+        checks its SHA-256, and runs it against a pinned CUDA 13.0 runtime.
+        That runtime is installed from pip wheels into a private folder;
+        PyTorch's environment is not touched. Every departure from ActQuant's
+        documented setup, including those made at build time, is listed as a
         deviation in the report.
 
         The smoke test uses a synthetic image and a fixed prompt. It shows that
@@ -61,22 +66,12 @@ def _(mo):
         **Before running**
 
         1. Attach the GPU and open the **Server** preview.
-        2. From the **Packages** panel install `cmake`, `ninja`,
-           `huggingface_hub`, and optionally `pybind11` (for the `pi05.so`
-           binding), pinned in `requirements/actquant-build.txt`.
-        3. Do not install CUDA packages. The `toolkit` stage installs a pinned,
-           version-consistent CUDA 13.0 toolkit (about 0.5 GB of wheels) into
-           the work folder; PyTorch's environment is not touched.
+        2. From the **Packages** panel install `huggingface_hub`, pinned in
+           `requirements/actquant-build.txt`. Do not install CUDA packages.
 
-        No token is needed: ActQuant and the checkpoint are public.
-
-        Sources, build trees and the checkpoint are kept in a work folder for
-        the session, so you can rerun single stages and the build continues
-        where it stopped. The first build compiles ggml's CUDA kernels and can
-        take a long time. The build runs as a separate process, so it keeps
-        going if the notebook disconnects; the status below the button updates
-        itself and picks the run up again after a reconnect. The run's logs can
-        be downloaded at any time, also while it is still building.
+        No token is needed: the package, ActQuant and the checkpoint are public.
+        The whole run takes a few minutes. The package, toolkit and checkpoint
+        stay in a work folder for the session, so single stages can be rerun.
         """
     )
     return
@@ -145,6 +140,7 @@ def _(Path, mo, os):
         "scripts/actquant_build.py",
         "requirements/actquant-build.txt",
         "requirements/actquant-cuda-toolkit.txt",
+        "requirements/actquant-prebuilt.json",
     )
     repository_root = locate_repository()
     fetch_error = None
@@ -163,11 +159,13 @@ def _(Path, mo, os):
     toolkit_requirements = (
         repository_root / "requirements" / "actquant-cuda-toolkit.txt" if repository_root else None
     )
+    prebuilt_pin = repository_root / "requirements" / "actquant-prebuilt.json" if repository_root else None
     return (
         build_requirements,
         build_script,
         eaq_commit,
         fetch_error,
+        prebuilt_pin,
         repository_root,
         repository_source,
         toolkit_requirements,
@@ -181,8 +179,10 @@ def _(
     eaq_commit,
     fetch_error,
     importlib_metadata,
+    json,
     mo,
     os,
+    prebuilt_pin,
     repository_root,
     repository_source,
     shutil,
@@ -223,8 +223,14 @@ def _(
     except OSError as _exc:
         _disk_text = f"unavailable ({type(_exc).__name__})"
 
-    _existing = [name for name in ("ActQuant", "checkpoints") if (work_dir / name).exists()]
-    _existing += sorted(path.name for path in work_dir.glob("build-*")) if work_dir.exists() else []
+    _existing = [name for name in ("cuda-toolkit", "prebuilt", "checkpoints") if (work_dir / name).exists()]
+    try:
+        _pin = json.loads(prebuilt_pin.read_text(encoding="utf-8")) if prebuilt_pin is not None else {}
+    except (OSError, ValueError):
+        _pin = {}
+    _pin_text = (f"`{_pin['tag']}` of `{_pin['repository']}`, SHA-256 `{_pin['sha256'][:12]}…`"
+                 if _pin.get("tag") and _pin.get("sha256") else
+                 "**none yet**: run the *ActQuant build* workflow and copy the pin from its summary")
 
     _lines = [
         "## Environment",
@@ -237,6 +243,7 @@ def _(
         + (", ".join(f"`{_l.strip()}`" for _l in toolkit_requirements.read_text(encoding="utf-8").splitlines()
                      if "==" in _l and not _l.lstrip().startswith("#"))
            if toolkit_requirements is not None else "not found"),
+        f"- Runtime package: {_pin_text}",
         f"- GPU: `{_gpu}`",
         f"- Work folder: `{work_dir}`; disk {_disk_text}; "
         + (f"already contains {', '.join(f'`{item}`' for item in _existing)}" if _existing else "empty"),
@@ -244,7 +251,7 @@ def _(
         "| Package | Installed | Pinned |",
         "| --- | --- | --- |",
         *(f"| `{name}` | `{_version(name)}` | `{_pins.get(name, '—')}` |"
-          for name in ("torch", "cmake", "ninja", "huggingface_hub", "pybind11")),
+          for name in ("torch", "huggingface_hub")),
     ]
     mo.md("\n".join(_lines))
     return (work_dir,)
@@ -252,47 +259,33 @@ def _(
 
 @app.cell
 def _(mo):
+    # Compiling (source/configure/build/package) happens in GitHub Actions, not here.
     stage_picker = mo.ui.multiselect(
-        options=["toolkit", "source", "configure", "build", "download", "infer"],
-        value=["toolkit", "source", "configure", "build", "download", "infer"],
+        options=["toolkit", "fetch", "download", "infer"],
+        value=["toolkit", "fetch", "download", "infer"],
         label="Stages (always run in this order)",
     )
-    no_vmm = mo.ui.checkbox(
-        label="Build without CUDA virtual memory management (GGML_CUDA_NO_VMM; separate build tree)"
-    )
-    no_flash_attn = mo.ui.checkbox(
-        value=True,
-        label="Skip ggml's FlashAttention CUDA kernels (unused by pi05; roughly halves compile time; "
-              "separate build tree)",
-    )
     cpu_check = mo.ui.checkbox(label="Also run the CLI on CPU and compare with CUDA (slower)")
-    build_jobs = mo.ui.dropdown(
-        options=["auto", "4", "8", "16", "20"],
-        value="auto",
-        label="Parallel build jobs (auto: reported CPUs, limited by memory, at most 16)",
-    )
     run_build = mo.ui.run_button(
-        label="Run ActQuant build",
+        label="Run ActQuant",
         kind="success",
         tooltip="Starts scripts/actquant_build.py with the selected stages in a new run folder.",
     )
-    mo.vstack([stage_picker, no_vmm, no_flash_attn, cpu_check, build_jobs, run_build])
-    return build_jobs, cpu_check, no_flash_attn, no_vmm, run_build, stage_picker
+    mo.vstack([stage_picker, cpu_check, run_build])
+    return cpu_check, run_build, stage_picker
 
 
 @app.cell
 def _(
     Path,
-    build_jobs,
     build_script,
     cpu_check,
     datetime,
     eaq_commit,
     fetch_error,
     json,
-    no_flash_attn,
-    no_vmm,
     os,
+    prebuilt_pin,
     repository_source,
     run_build,
     stage_picker,
@@ -302,8 +295,8 @@ def _(
     toolkit_requirements,
     work_dir,
 ):
-    # The script runs detached with its output in a log file, so neither a disconnect nor this
-    # kernel's end stops it. last_run.json lets the status cell (and a new session) find it.
+    # The script runs detached with its output in a log file, so a disconnect does not stop it.
+    # last_run.json lets the status cell (and a new session) find it.
     last_run_file = work_dir / "last_run.json"
 
     def read_json(path):
@@ -334,15 +327,9 @@ def _(
             _run_dir.mkdir(parents=True, exist_ok=False)
             _command = [sys.executable, str(build_script), "--output", str(_run_dir),
                         "--work-dir", str(work_dir), "--toolkit-requirements", str(toolkit_requirements),
-                        "--stages", *stage_picker.value]
-            if no_vmm.value:
-                _command.append("--no-vmm")
-            if no_flash_attn.value:
-                _command.append("--no-flash-attn")
+                        "--prebuilt-pin", str(prebuilt_pin), "--stages", *stage_picker.value]
             if cpu_check.value:
                 _command.append("--cpu-check")
-            if build_jobs.value != "auto":
-                _command += ["--jobs", build_jobs.value]
             (_run_dir / "manifest.json").write_text(json.dumps({
                 "schema_version": 2,
                 "run_id": _run_id,
@@ -413,7 +400,7 @@ def _(
     _items = [mo.md(launch["notice"])] if launch["notice"] else []
     _last = read_json(last_run_file)
     if _last is None:
-        _items.append(mo.md("No run yet. Choose stages and click **Run ActQuant build**."))
+        _items.append(mo.md("No run yet. Choose stages and click **Run ActQuant**."))
     else:
         _run_dir = Path(_last["run_dir"])
         _process = launch["process"]
@@ -437,18 +424,9 @@ def _(
                 _elapsed_text = "unknown time"
             _stage = next((name for name, entry in ((_report or {}).get("stages") or {}).items()
                            if entry.get("status") == "running"), "starting")
-            _samples = [json.loads(_line) for _line in
-                        _log_tail(_run_dir / "resources.log", lines=8).splitlines() if _line.startswith("{")]
-            _now = _samples[-1] if _samples else {}
-            _files = next((_sample for _sample in reversed(_samples) if "tmp_files_gib" in _sample), {})
-            _resources_text = (
-                f"\n\nResources at {_now.get('time')}: sandbox up {_now.get('uptime_min')} min, "
-                f"{_now.get('processes')} processes, {_now.get('processes_rss_gib')} GiB resident, "
-                f"{_now.get('cached_gib')} GiB cached; files in /tmp {_files.get('tmp_files_gib')} GiB, "
-                f"in ~/.cache {_files.get('cache_files_gib')} GiB" if _now else "")
             _items.append(mo.md(
                 f"**Running** run `{_last['run_id']}`: stage `{_stage}`, started {_elapsed_text} ago."
-                f"{_resources_text}\n\n```text\n{_log_tail(_run_dir / 'notebook.log')}\n```"
+                f"\n\n```text\n{_log_tail(_run_dir / 'notebook.log')}\n```"
             ))
             _items.append(_download)
         else:
@@ -482,9 +460,8 @@ def _(
                 if _status == "interrupted":
                     _items.append(mo.md(
                         "The run was killed without finishing; the table shows the stage it was in. "
-                        "`resources.log` in the ZIP shows memory, load and file sizes until then. "
-                        "Rerun to continue: the build resumes where it stopped if the work folder "
-                        "survived.\n\n```text\n" + _log_tail(_run_dir / "notebook.log") + "\n```"
+                        "Rerun it; stages that finished are reused if the work folder survived."
+                        "\n\n```text\n" + _log_tail(_run_dir / "notebook.log") + "\n```"
                     ))
 
                 _infer = _report.get("stages", {}).get("infer", {})

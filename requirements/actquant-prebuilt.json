@@ -1,0 +1,7 @@
+{
+  "_comment": "ActQuant runtime package fetched by notebooks/02_actquant_build.py. Produced by .github/workflows/actquant-build.yml, whose run summary prints these four fields; the fetch stage refuses a download whose SHA-256 differs.",
+  "repository": "vmanvs/EAQ",
+  "tag": "",
+  "asset": "",
+  "sha256": ""
+}

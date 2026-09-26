@@ -1,9 +1,10 @@
-# ActQuant build notebook (notebooks/02_actquant_build.py). Keep Molab's PyTorch.
-# Install these from the Packages panel:
+# ActQuant runtime. The GitHub Actions build (.github/workflows/actquant-build.yml)
+# installs all of these; on Molab only huggingface_hub is needed (Packages panel), since
+# notebooks/02_actquant_build.py fetches a prebuilt package instead of compiling.
 cmake==4.4.3
 ninja==1.13.2
 huggingface_hub==0.34.4
-# Optional: builds the pi05.so Python binding that ActQuant's policy server loads.
+# Builds the pi05.so Python binding that ActQuant's policy server loads.
 pybind11==3.1.0
 # The CUDA toolkit itself is pinned in actquant-cuda-toolkit.txt and installed by the
 # script's toolkit stage; do not install it from the Packages panel.

@@ -1,0 +1,141 @@
+name: ActQuant build
+
+# Compiles ActQuant's Pi 0.5 runtime for Molab's GPU on a runner without a GPU, in a container
+# matching Molab (Debian 13, glibc 2.41, gcc 14, Python 3.13), smoke-tests the package with one
+# CPU inference, and publishes it as a release for notebooks/02_actquant_build.py to fetch.
+# Compiling inside Molab gets its sandbox reset (docs/molab.md).
+on:
+  workflow_dispatch:
+    inputs:
+      cuda_arch:
+        description: "CUDA architecture (Molab's RTX PRO 6000 Blackwell is 120)"
+        required: true
+        default: "120"
+      flash_attn_stubs:
+        description: "Compile ggml's FlashAttention CUDA kernels as stubs (pi05 does not use them)"
+        type: boolean
+        default: true
+      cpu_smoke_test:
+        description: "Download the checkpoint and run one CPU inference from the package"
+        type: boolean
+        default: true
+      publish_release:
+        description: "Publish the package as a GitHub release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: actquant-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    container:
+      image: python:3.13-slim-trixie
+    env:
+      EAQ_WORK_DIR: /tmp/eaq-work
+      CUDA_ARCH: ${{ inputs.cuda_arch }}
+      FLASH_ATTN_STUBS: ${{ inputs.flash_attn_stubs }}
+      CPU_SMOKE_TEST: ${{ inputs.cpu_smoke_test }}
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_ROOT_USER_ACTION: ignore
+    steps:
+      - name: Install system packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential git patchelf ca-certificates
+
+      - uses: actions/checkout@v4
+
+      - name: Install Python packages
+        run: python -m pip install -r requirements/actquant-build.txt uv==0.12.15
+
+      - name: Build, package and smoke-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$CUDA_ARCH" =~ ^[0-9]{2,3}[af]?$ ]]; then
+            echo "Invalid cuda_arch: $CUDA_ARCH" >&2
+            exit 1
+          fi
+          stages=(toolkit source configure build package)
+          # No driver on the runner: ggml's VMM pool links libcuda, so it is disabled.
+          flags=(--no-gpu --cuda-arch "$CUDA_ARCH" --no-vmm)
+          if [ "$FLASH_ATTN_STUBS" = "true" ]; then flags+=(--no-flash-attn); fi
+          if [ "$CPU_SMOKE_TEST" = "true" ]; then
+            stages+=(download infer)
+            flags+=(--infer-device CPU)
+          fi
+          python scripts/actquant_build.py --output out "${flags[@]}" --stages "${stages[@]}"
+
+      - name: Upload run folder
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: actquant-build-${{ github.run_number }}
+          # The unpacked package folder duplicates the tarball.
+          path: |
+            out/
+            !out/package/*/**
+          retention-days: 30
+          if-no-files-found: warn
+
+  release:
+    needs: build
+    if: inputs.publish_release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: actquant-build-${{ github.run_number }}
+          path: out
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          tarball=$(ls out/package/*.tar.gz)
+          asset=$(basename "$tarball")
+          tag="${asset%.tar.gz}-r${RUN_NUMBER}"
+          sha256=$(cut -d' ' -f1 "$tarball.sha256")
+          export ASSET="$asset" TAG="$tag" SHA256="$sha256"
+          python3 - <<'EOF'
+          import json, os
+          report = json.load(open("out/report.json"))
+          stages = report.get("stages", {})
+          infer = stages.get("infer", {}).get("cli_cuda") or {}
+          pin = {"repository": os.environ["REPO"], "tag": os.environ["TAG"],
+                 "asset": os.environ["ASSET"], "sha256": os.environ["SHA256"]}
+          lines = [
+              f"ActQuant Pi 0.5 runtime for sm_{report['options']['cuda_arch']}, built by {os.environ['RUN_URL']}.",
+              "",
+              f"- ActQuant commit: `{report['actquant']['commit']}`",
+              f"- EAQ commit: `{os.environ['GITHUB_SHA']}`",
+              f"- Stages: " + ", ".join(f"{name} {entry['status']}" for name, entry in stages.items()),
+          ]
+          if infer:
+              lines.append(f"- CPU smoke test: backend `{infer.get('backend')}`, "
+                           f"{infer.get('inference_ms')} ms, stats `{infer.get('stats')}`")
+          lines += ["", "Deviations from ActQuant's documented setup:", ""]
+          lines += [f"- {item}" for item in report.get("deviations", [])]
+          lines += ["", "Pin for `requirements/actquant-prebuilt.json`:", "", "```json",
+                    json.dumps(pin, indent=2), "```"]
+          open("notes.md", "w").write("\n".join(lines) + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("\n".join(["## Package pin", "",
+                                       "Copy into `requirements/actquant-prebuilt.json`:", "",
+                                       "```json", json.dumps(pin, indent=2), "```", ""]))
+          EOF
+          gh release create "$tag" "$tarball" "$tarball.sha256" out/report.json \
+            --repo "$REPO" --target "$GITHUB_SHA" --title "$tag" --notes-file notes.md

@@ -45,9 +45,11 @@ GPU execution, headless rendering, model access, and whether ActQuant's
 pipeline can be built, before any large download. See the
 [Molab guide](docs/molab.md) for running it, the observed environment, and the
 resulting build recipe. It validates infrastructure only; it does not run a
-policy or benchmark. [The ActQuant build notebook](notebooks/02_actquant_build.py)
-then applies that recipe. It builds ActQuant's Pi 0.5 runtime, downloads the
-released 3-bit checkpoint, and runs one CUDA inference as a smoke test. The earlier [Kaggle preflight](docs/kaggle.md) remains
+policy or benchmark. ActQuant's Pi 0.5 runtime is compiled by
+[a GitHub Actions workflow](.github/workflows/actquant-build.yml) in a
+Molab-matching container and published as a release. [The ActQuant runtime
+notebook](notebooks/02_actquant_build.py) fetches that pinned package, downloads
+the released 3-bit checkpoint, and runs one CUDA inference as a smoke test. The earlier [Kaggle preflight](docs/kaggle.md) remains
 available as an alternative.
 
 ## Experimental approach
