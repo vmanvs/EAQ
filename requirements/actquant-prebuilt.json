@@ -1,7 +1,7 @@
 {
   "_comment": "ActQuant runtime package fetched by notebooks/02_actquant_build.py. Produced by .github/workflows/actquant-build.yml, whose run summary prints these four fields; the fetch stage refuses a download whose SHA-256 differs.",
   "repository": "vmanvs/EAQ",
-  "tag": "",
-  "asset": "",
-  "sha256": ""
+  "tag": "actquant-pi05-sm120-cu13.0-novmm-nofa-portable-b647911-r2",
+  "asset": "actquant-pi05-sm120-cu13.0-novmm-nofa-portable-b647911.tar.gz",
+  "sha256": "7f08c6bb01702b74233b8094b02138d7b5e35595f580e0751e3359ee44efaf8e"
 }
