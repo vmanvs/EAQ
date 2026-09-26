@@ -18,6 +18,9 @@ order and each writes `report.json`, so a partial run still leaves evidence:
 
 The work directory keeps sources, build trees and checkpoints between runs in
 one session, so stages can be rerun individually and builds are incremental.
+A lock in the work directory stops two runs from building the same tree; the
+notebook starts this script as a detached process so a disconnected notebook
+does not kill the build.
 This is one self-contained file: Molab fetches it alone and may run Python
 with PYTHONSAFEPATH, which blocks sibling-module imports.
 """
@@ -105,6 +108,77 @@ def _run(command, timeout=60, cwd=None, env=None):
     except subprocess.TimeoutExpired:
         return {"returncode": None, "output": f"timed out after {timeout} s"}
     return {"returncode": result.returncode, "output": (result.stdout + result.stderr).strip()}
+
+
+def _read_bytes_value(path):
+    try:
+        text = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    # "max" (v2) or a near-2^63 value (v1) both mean "no limit".
+    return int(text) if text.isdigit() and int(text) < 2**60 else None
+
+
+def memory_sample():
+    """Available memory and, when the sandbox exposes one, the cgroup's usage and limit, in GiB."""
+    sample = {}
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            fields = dict(line.split(":", 1) for line in handle if ":" in line)
+        sample["available_gib"] = round(int(fields["MemAvailable"].split()[0]) / 2**20, 1)
+    except (OSError, KeyError, ValueError):
+        pass
+    for key, paths in (("cgroup_used_gib", ("/sys/fs/cgroup/memory.current",
+                                            "/sys/fs/cgroup/memory/memory.usage_in_bytes")),
+                       ("cgroup_limit_gib", ("/sys/fs/cgroup/memory.max",
+                                             "/sys/fs/cgroup/memory/memory.limit_in_bytes"))):
+        for path in paths:
+            value = _read_bytes_value(path)
+            if value is not None:
+                sample[key] = round(value / 2**30, 1)
+                break
+    return sample
+
+
+class MemoryWatch:
+    """Log memory every few seconds during a long stage, to tell out-of-memory kills from disconnects."""
+
+    def __init__(self, log_path, interval=15, low_gib=8.0):
+        self.log_path, self.interval, self.low_gib = log_path, interval, low_gib
+        self.min_available = None
+        self.max_cgroup_used = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join(timeout=30)
+
+    def _loop(self):
+        last_warning = 0.0
+        with open(self.log_path, "a", encoding="utf-8") as handle:
+            while not self._stop.wait(self.interval):
+                sample = memory_sample()
+                handle.write(json.dumps({"time": dt.datetime.now().strftime("%H:%M:%S"), **sample}) + "\n")
+                handle.flush()
+                available = sample.get("available_gib")
+                if available is not None:
+                    self.min_available = min(available, self.min_available if self.min_available is not None
+                                             else available)
+                    if available < self.low_gib and time.monotonic() - last_warning > 60:
+                        last_warning = time.monotonic()
+                        log(f"low memory: {available} GiB available")
+                if "cgroup_used_gib" in sample:
+                    self.max_cgroup_used = max(sample["cgroup_used_gib"], self.max_cgroup_used or 0.0)
+
+    @property
+    def summary(self):
+        return {"min_available_gib": self.min_available, "max_cgroup_used_gib": self.max_cgroup_used,
+                "log": self.log_path.name}
 
 
 def _stream(command, log_path, timeout, cwd=None, env=None, echo=True):
@@ -295,6 +369,8 @@ class Builder:
             memory = {key: round(int(fields[key].split()[0]) / 2**20, 1) for key in ("MemTotal", "MemAvailable")}
         except (OSError, KeyError, ValueError):
             pass
+        if memory is not None and "cgroup_limit_gib" in (sample := memory_sample()):
+            memory["cgroup_limit_gib"] = sample["cgroup_limit_gib"]
         try:
             usage = shutil.disk_usage(self.work.parent if not self.work.exists() else self.work)
             disk = {"free_gib": round(usage.free / 2**30, 1), "total_gib": round(usage.total / 2**30, 1)}
@@ -333,16 +409,47 @@ class Builder:
         self.report["finished_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
         (self.output / "report.json").write_text(json.dumps(self.report, indent=2) + "\n", encoding="utf-8")
 
+    def _lock(self):
+        """Hold an exclusive lock on the work folder, or return a description of its holder."""
+        try:
+            import fcntl
+        except ImportError:  # not Linux; nothing to guard against locally
+            return None
+        self._lock_file = open(self.work / ".build.lock", "a+", encoding="utf-8")
+        try:
+            fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._lock_file.seek(0)
+            return self._lock_file.read().strip() or "another run"
+        self._lock_file.seek(0)
+        self._lock_file.truncate()
+        self._lock_file.write(f"pid {os.getpid()}, run folder {self.output}\n")
+        self._lock_file.flush()
+        return None
+
     def run(self):
         self.output.mkdir(parents=True, exist_ok=True)
         self.work.mkdir(parents=True, exist_ok=True)
+        holder = self._lock()
+        if holder:
+            log(f"work folder {self.work} is in use by {holder}; not starting a second run")
+            self.report["status"] = "failed"
+            self.report["error"] = f"work folder in use by {holder}"
+            self.save()
+            (self.output / "exit_code").write_text("1\n", encoding="utf-8")
+            return 1
         requested = [stage for stage in STAGES if stage in self.args.stages]
         failed = None
+        # "running" stays in report.json if the process is killed, showing where it stopped.
+        self.report["status"] = "running"
         for stage in requested:
             if failed:
                 self.report["stages"][stage] = {"status": "skipped", "reason": f"stage '{failed}' failed"}
                 continue
             log(f"=== stage: {stage} ===")
+            self.report["stages"][stage] = {"status": "running",
+                                            "started_utc": dt.datetime.now(dt.timezone.utc).isoformat()}
+            self.save()
             started = time.monotonic()
             try:
                 details = getattr(self, f"stage_{stage}")() or {}
@@ -369,7 +476,9 @@ class Builder:
             self.report["status"] = "stages_passed"
         self.save()
         log(f"status: {self.report['status']}")
-        return 0 if not failed else 1
+        code = 0 if not failed else 1
+        (self.output / "exit_code").write_text(f"{code}\n", encoding="utf-8")
+        return code
 
     # ------------------------------------------------------------------ stages
 
@@ -560,10 +669,12 @@ class Builder:
         if self.args.jobs:
             return self.args.jobs
         cpus = self.report["host"]["cpus"] or 4
-        available = (self.report["host"]["memory_gib"] or {}).get("MemAvailable")
-        # CUDA template instances take about 2 GiB each to compile.
-        by_memory = int(available // 2.5) if available else cpus
-        return max(1, min(cpus, by_memory, 64))
+        memory = self.report["host"]["memory_gib"] or {}
+        budgets = [value for value in (memory.get("MemAvailable"), memory.get("cgroup_limit_gib")) if value]
+        # CUDA template instances take 2-4 GiB each to compile. The cap of 8 leaves headroom in
+        # sandboxes whose real memory limit is lower than what /proc/meminfo reports.
+        by_memory = int(min(budgets) // 4) if budgets else cpus
+        return max(1, min(cpus, by_memory, 8))
 
     def stage_build(self):
         cmake = _which("cmake")
@@ -574,10 +685,11 @@ class Builder:
         targets = [*BUILD_TARGETS, *(["pi05_py"] if binding else [])]
         jobs = self._jobs()
         log(f"building {', '.join(targets)} with {jobs} parallel jobs; the first build takes a while")
-        result = _stream([cmake, "--build", self.build_dir, "--target", *targets, "-j", str(jobs)],
-                         self.output / "build.log", self.args.build_timeout)
+        with MemoryWatch(self.output / "memory.log") as memory:
+            result = _stream([cmake, "--build", self.build_dir, "--target", *targets, "-j", str(jobs)],
+                             self.output / "build.log", self.args.build_timeout)
         details = {"targets": targets, "jobs": jobs, "returncode": result["returncode"],
-                   "build_seconds": result["seconds"]}
+                   "build_seconds": result["seconds"], "memory": memory.summary}
         if result["timed_out"]:
             raise StageError(f"Build timed out after {self.args.build_timeout} s; rerun to continue "
                              "(the build is incremental).", {**details, "tail": result["tail"][-4000:]})
@@ -769,7 +881,7 @@ def main():
                         default=Path(__file__).resolve().parents[1] / "requirements" / "actquant-cuda-toolkit.txt",
                         help="Pinned CUDA toolkit wheels installed by the toolkit stage.")
     parser.add_argument("--cuda-arch", help="Override the GPU architecture, e.g. 120.")
-    parser.add_argument("--jobs", type=int, help="Parallel build jobs (default: CPUs, limited by RAM).")
+    parser.add_argument("--jobs", type=int, help="Parallel build jobs (default: CPUs, limited by memory, at most 8).")
     parser.add_argument("--no-vmm", action="store_true", help="Build with GGML_CUDA_NO_VMM=ON.")
     parser.add_argument("--no-binding", action="store_true", help="Do not build the pi05.so Python binding.")
     parser.add_argument("--cpu-check", action="store_true", help="Also run the CLI on CPU and compare.")

@@ -5,7 +5,6 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
-    import collections
     import io
     import json
     import os
@@ -13,7 +12,6 @@ def _():
     import subprocess
     import sys
     import tempfile
-    import threading
     import time
     from datetime import datetime, timezone
     from importlib import metadata as importlib_metadata
@@ -26,7 +24,6 @@ def _():
         Path,
         ZIP_DEFLATED,
         ZipFile,
-        collections,
         datetime,
         importlib_metadata,
         io,
@@ -37,7 +34,6 @@ def _():
         subprocess,
         sys,
         tempfile,
-        threading,
         time,
         timezone,
     )
@@ -79,7 +75,10 @@ def _(mo):
         Sources, build trees and the checkpoint are kept in a work folder for
         the session, so you can rerun single stages and the build continues
         where it stopped. The first build compiles ggml's CUDA kernels and can
-        take a long time. Download the run artifacts before the session ends.
+        take a long time. The build runs as a separate process, so it keeps
+        going if the notebook disconnects: reopen the notebook (or rerun the
+        cell below the button) to reattach to it and see its result. Download
+        the run artifacts before the session ends.
         """
     )
     return
@@ -264,19 +263,25 @@ def _(mo):
         label="Build without CUDA virtual memory management (GGML_CUDA_NO_VMM; separate build tree)"
     )
     cpu_check = mo.ui.checkbox(label="Also run the CLI on CPU and compare with CUDA (slower)")
+    build_jobs = mo.ui.dropdown(
+        options=["auto", "4", "8", "12", "16", "20"],
+        value="auto",
+        label="Parallel build jobs (auto: up to 8, limited by memory)",
+    )
     run_build = mo.ui.run_button(
         label="Run ActQuant build",
         kind="success",
         tooltip="Runs scripts/actquant_build.py with the selected stages in a new run folder.",
     )
-    mo.vstack([stage_picker, no_vmm, cpu_check, run_build])
-    return cpu_check, no_vmm, run_build, stage_picker
+    mo.vstack([stage_picker, no_vmm, cpu_check, build_jobs, run_build])
+    return build_jobs, cpu_check, no_vmm, run_build, stage_picker
 
 
 @app.cell
 def _(
+    Path,
+    build_jobs,
     build_script,
-    collections,
     cpu_check,
     datetime,
     eaq_commit,
@@ -290,18 +295,51 @@ def _(
     stage_picker,
     subprocess,
     sys,
-    threading,
     time,
     timezone,
     toolkit_requirements,
     work_dir,
 ):
+    # The script runs detached, writing to a log file: a disconnected notebook no longer kills
+    # the build through a broken output pipe. last_run.json lets a new session reattach.
+    _last_run_file = work_dir / "last_run.json"
+
+    def _read_json(path):
+        try:
+            return json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def _alive(pid):
+        # A finished child of this kernel is a zombie with an empty cmdline, so it counts as ended.
+        try:
+            return b"actquant_build" in Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return False
+
+    def _log_tail(path, lines=40):
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - 65536))
+                text = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+        return "\n".join(text.splitlines()[-lines:])
+
     build_result = None
+    _notice = None
+    _process = None
+    _last = _read_json(_last_run_file)
+    _last_alive = bool(_last) and _alive(_last["pid"])
     if run_build.value:
         if build_script is None:
             build_result = {"error": f"Build script not available: {fetch_error}"}
         elif not stage_picker.value:
             build_result = {"error": "Select at least one stage."}
+        elif _last_alive:
+            _notice = (f"Run `{_last['run_id']}` is still running, so no new run was started. "
+                       "Showing that run instead.")
         else:
             _run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + os.urandom(3).hex()
             _run_dir = work_dir / "runs" / _run_id
@@ -313,53 +351,52 @@ def _(
                 _command.append("--no-vmm")
             if cpu_check.value:
                 _command.append("--cpu-check")
-            _manifest = {
-                "schema_version": 1,
+            if build_jobs.value != "auto":
+                _command += ["--jobs", build_jobs.value]
+            (_run_dir / "manifest.json").write_text(json.dumps({
+                "schema_version": 2,
                 "run_id": _run_id,
                 "started_utc": datetime.now(timezone.utc).isoformat(),
                 "eaq_commit": eaq_commit,
                 "repository_source": repository_source,
                 "command": _command,
-            }
-
-            # Stream the script's output into this cell while it runs; the build is long.
+            }, indent=2) + "\n", encoding="utf-8")
             _env = os.environ.copy()
             _env["PYTHONUNBUFFERED"] = "1"
-            _tail = collections.deque(maxlen=40)
-            _log_path = _run_dir / "notebook.log"
-            _process = subprocess.Popen(_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                        text=True, errors="replace", bufsize=1, env=_env)
+            with open(_run_dir / "notebook.log", "w", encoding="utf-8") as _log_handle:
+                _process = subprocess.Popen(_command, stdin=subprocess.DEVNULL, stdout=_log_handle,
+                                            stderr=subprocess.STDOUT, env=_env, start_new_session=True)
+            _last = {"run_id": _run_id, "run_dir": str(_run_dir), "pid": _process.pid}
+            _last_run_file.write_text(json.dumps(_last) + "\n", encoding="utf-8")
+    elif _last is not None:
+        _notice = (f"Reattached to run `{_last['run_id']}`, which is still running."
+                   if _last_alive else f"Showing the last run, `{_last['run_id']}`.")
 
-            def _pump(process=_process, tail=_tail, log_path=_log_path):
-                with open(log_path, "w", encoding="utf-8") as handle:
-                    for line in process.stdout:
-                        handle.write(line)
-                        tail.append(line.rstrip("\n"))
+    if build_result is None and _last is not None:
+        _run_dir = Path(_last["run_dir"])
+        _started = time.monotonic()
+        while (_process.poll() is None) if _process is not None else _alive(_last["pid"]):
+            _elapsed = int(time.monotonic() - _started)
+            mo.output.replace(mo.md(
+                (f"{_notice}\n\n" if _notice else "")
+                + f"**Running** (watched for {_elapsed // 60} min {_elapsed % 60} s) — `{_run_dir}`\n\n"
+                "```text\n" + _log_tail(_run_dir / "notebook.log") + "\n```"
+            ))
+            time.sleep(3)
+        mo.output.clear()
 
-            _reader = threading.Thread(target=_pump, daemon=True)
-            _reader.start()
-            _started = time.monotonic()
-            while _process.poll() is None:
-                _elapsed = int(time.monotonic() - _started)
-                mo.output.replace(mo.md(
-                    f"**Running** ({_elapsed // 60} min {_elapsed % 60} s) — `{_run_dir}`\n\n"
-                    "```text\n" + "\n".join(_tail) + "\n```"
-                ))
-                time.sleep(3)
-            _reader.join(timeout=30)
-            mo.output.clear()
-
+        _code_text = (_run_dir / "exit_code").read_text(encoding="utf-8").strip() \
+            if (_run_dir / "exit_code").is_file() else ""
+        _exit_code = _process.returncode if _process is not None else (
+            int(_code_text) if _code_text.lstrip("-").isdigit() else None)
+        _manifest = _read_json(_run_dir / "manifest.json") or {}
+        if "finished_utc" not in _manifest:
             _manifest["finished_utc"] = datetime.now(timezone.utc).isoformat()
-            _manifest["exit_code"] = _process.returncode
+            _manifest["exit_code"] = _exit_code
             (_run_dir / "manifest.json").write_text(json.dumps(_manifest, indent=2) + "\n", encoding="utf-8")
-            _report = None
-            if (_run_dir / "report.json").is_file():
-                try:
-                    _report = json.loads((_run_dir / "report.json").read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    _report = None
-            build_result = {"run_id": _run_id, "run_dir": _run_dir, "exit_code": _process.returncode,
-                            "report": _report, "log_tail": "\n".join(_tail)}
+        build_result = {"run_id": _last["run_id"], "run_dir": _run_dir, "exit_code": _exit_code,
+                        "report": _read_json(_run_dir / "report.json"), "notice": _notice,
+                        "log_tail": _log_tail(_run_dir / "notebook.log")}
     return (build_result,)
 
 
@@ -371,6 +408,8 @@ def _(ZIP_DEFLATED, ZipFile, build_result, io, json, mo):
     elif "error" in build_result:
         _items.append(mo.md(f"**Could not start:** {build_result['error']}"))
     else:
+        if build_result.get("notice"):
+            _items.append(mo.md(build_result["notice"]))
         _report = build_result["report"]
         if _report is None:
             _items.append(mo.md(
@@ -378,15 +417,25 @@ def _(ZIP_DEFLATED, ZipFile, build_result, io, json, mo):
                 "```text\n" + build_result["log_tail"] + "\n```"
             ))
         else:
+            # A report still saying "running" means the process was killed mid-stage.
+            _status = "interrupted" if _report.get("status") == "running" else _report.get("status")
             _rows = ["| Stage | Status | Time | Note |", "| --- | --- | --- | --- |"]
             for _stage, _entry in _report.get("stages", {}).items():
                 _note = _entry.get("error") or _entry.get("reason") or _entry.get("note") or ""
-                _rows.append(f"| `{_stage}` | **{_entry['status']}** | {_entry.get('seconds', '')} s | "
+                _entry_status = "interrupted" if _entry["status"] == "running" else _entry["status"]
+                _rows.append(f"| `{_stage}` | **{_entry_status}** | {_entry.get('seconds', '')} s | "
                              f"{str(_note).replace('|', '/')} |")
             _items.append(mo.md(
-                f"## Result: `{_report.get('status')}`\n\n"
+                f"## Result: `{_status}`\n\n"
                 f"Run folder: `{build_result['run_dir']}`\n\n" + "\n".join(_rows)
             ))
+            if _status == "interrupted":
+                _items.append(mo.md(
+                    "The run was killed without finishing; the table shows the stage it was in. "
+                    "`memory.log` in the ZIP shows whether memory ran low. Rerun to continue: "
+                    "the build resumes where it stopped if the work folder survived.\n\n"
+                    "```text\n" + build_result["log_tail"] + "\n```"
+                ))
 
             _infer = _report.get("stages", {}).get("infer", {})
             _cuda = _infer.get("cli_cuda")

@@ -133,8 +133,8 @@ notebook below.
    (Ubuntu 22.04, CUDA 12.6, conda).
 
 Open questions: whether ActQuant's own ggml kernels build and run under this
-setup (the first build reached 40 of 234 steps before the version mix
-stopped it), real scratch-disk capacity, and whether long policy-server rollouts fit
+setup (with the pinned 13.0 toolkit a build reached 232 of 234 steps before the
+notebook disconnected), why long notebook runs disconnect, real scratch-disk capacity, and whether long policy-server rollouts fit
 Molab's [usage restrictions](https://molab.marimo.io/pages/molab/restrictions)
 and 12-hour session limit.
 
@@ -151,6 +151,17 @@ through the GitHub API.
 2. Choose stages and click **Run ActQuant build**. Output streams into the
    notebook while it runs.
 3. Download the run artifacts before the session ends.
+
+The script runs as a separate process that writes to a log file, not as a
+child tied to the notebook's output. Before this change, every notebook
+disconnect ended the build: its output pipe broke. If the notebook
+disconnects now, reopen it or rerun the run cell. It reattaches to the
+running build, or shows the result if the build finished in the meantime. A
+lock on the work folder prevents a second build from starting while one is
+running. During the build, `memory.log` records available memory (and the
+cgroup's usage and limit, when visible) every 15 seconds, so out-of-memory
+kills can be told apart from disconnects. By default at most 8 compile jobs
+run at once; the notebook's jobs setting overrides this.
 
 | Stage | What it does |
 | --- | --- |
