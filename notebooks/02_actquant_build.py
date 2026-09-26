@@ -260,19 +260,24 @@ def _(mo):
     no_vmm = mo.ui.checkbox(
         label="Build without CUDA virtual memory management (GGML_CUDA_NO_VMM; separate build tree)"
     )
+    no_flash_attn = mo.ui.checkbox(
+        value=True,
+        label="Skip ggml's FlashAttention CUDA kernels (unused by pi05; roughly halves compile time; "
+              "separate build tree)",
+    )
     cpu_check = mo.ui.checkbox(label="Also run the CLI on CPU and compare with CUDA (slower)")
     build_jobs = mo.ui.dropdown(
-        options=["auto", "1", "2", "3", "4"],
+        options=["auto", "4", "8", "16", "20"],
         value="auto",
-        label="Parallel build jobs (auto: 2, leaving 2 of Molab's 4 CPUs for the notebook)",
+        label="Parallel build jobs (auto: reported CPUs, limited by memory, at most 16)",
     )
     run_build = mo.ui.run_button(
         label="Run ActQuant build",
         kind="success",
         tooltip="Starts scripts/actquant_build.py with the selected stages in a new run folder.",
     )
-    mo.vstack([stage_picker, no_vmm, cpu_check, build_jobs, run_build])
-    return build_jobs, cpu_check, no_vmm, run_build, stage_picker
+    mo.vstack([stage_picker, no_vmm, no_flash_attn, cpu_check, build_jobs, run_build])
+    return build_jobs, cpu_check, no_flash_attn, no_vmm, run_build, stage_picker
 
 
 @app.cell
@@ -285,6 +290,7 @@ def _(
     eaq_commit,
     fetch_error,
     json,
+    no_flash_attn,
     no_vmm,
     os,
     repository_source,
@@ -331,6 +337,8 @@ def _(
                         "--stages", *stage_picker.value]
             if no_vmm.value:
                 _command.append("--no-vmm")
+            if no_flash_attn.value:
+                _command.append("--no-flash-attn")
             if cpu_check.value:
                 _command.append("--cpu-check")
             if build_jobs.value != "auto":
@@ -434,7 +442,7 @@ def _(
             _now = _samples[-1] if _samples else {}
             _files = next((_sample for _sample in reversed(_samples) if "tmp_files_gib" in _sample), {})
             _resources_text = (
-                f"\n\nResources at {_now.get('time')}: load {_now.get('load_1min')} on 4 CPUs, "
+                f"\n\nResources at {_now.get('time')}: sandbox up {_now.get('uptime_min')} min, "
                 f"{_now.get('processes')} processes, {_now.get('processes_rss_gib')} GiB resident, "
                 f"{_now.get('cached_gib')} GiB cached; files in /tmp {_files.get('tmp_files_gib')} GiB, "
                 f"in ~/.cache {_files.get('cache_files_gib')} GiB" if _now else "")

@@ -161,26 +161,32 @@ run's ZIP can be downloaded at any time; while the build is running it is a
 snapshot of the logs so far. A lock on the work folder prevents a second
 build from starting while one is running.
 
-Every build so far lost the notebook connection partway through, at 20, 8
-and 4 parallel jobs. At 4 jobs this happened within minutes, with only about
-1 GiB of process memory in use. The cause is not established. Two suspects:
-- CPU starvation: the sandbox reports 20 CPUs, but each notebook gets 4, and
-  saturating them may starve the notebook server and the sandbox.
-- Memory held by files: gVisor can keep files written to its filesystem in
-  memory, and the process figures do not show that memory.
+Every build so far was cut off by a reset of the whole Molab sandbox: the
+next session started from an empty work folder. Memory was not the cause:
+processes used under 1 GiB and files in `/tmp` and `~/.cache` about 2 GiB.
+Builds with more parallel jobs got further (20 jobs reached step 232 of 234,
+2 jobs about step 51), which suggests a time limit that Molab does not
+document. The build therefore favours speed:
 
-The build therefore runs 2 jobs by default at low priority (nice 10); the
-notebook's jobs setting overrides this. During the build, `resources.log`
-records every 15 seconds the load average, the process count, the resident
-memory of all processes, and the kernel's cached and shared memory. Every
-minute it also records the size of the files in `/tmp` and `~/.cache`. The
-status cell shows the latest values.
+- By default it runs as many jobs as the sandbox reports CPUs, at most 16 and
+  limited by memory, at low priority (nice 10).
+- The **Skip FlashAttention kernels** option, on by default, configures
+  `GGML_CUDA_FA=OFF`. ggml then compiles its FlashAttention CUDA kernels as
+  stubs, which removes most of the compile time of about 55 of the 234 steps.
+  ActQuant's `tools/pi0.5` never calls `ggml_flash_attn_ext`, and the option is
+  recorded as a deviation.
+
+During the build, `resources.log` records every 15 seconds the sandbox's
+uptime (which dates a reset), the process count, the resident memory of all
+processes, and the kernel's cached and shared memory. Every minute it also
+records the size of the files in `/tmp` and `~/.cache`. gVisor does not
+implement the load average. The status cell shows the latest values.
 
 | Stage | What it does |
 | --- | --- |
 | `toolkit` | Installs the pinned CUDA 13.0 wheels (about 0.5 GB) into the work folder. It then checks that nvcc, the runtime headers and CCCL agree and that nvcc is not newer than the driver. It adds a `lib64 → lib` link, because the 13.0 nvcc wheel's `nvcc.profile` expects the system-install layout. Finally it compiles, links and runs a CUB + `cuda_fp16` kernel on the GPU |
 | `source` | Fetches ActQuant at its pinned commit and unpacks `vendor/tokenizers-cpp.zip` |
-| `configure` | Runs CMake with the recipe's flags and `LLAMA_CURL=OFF`; enables the `pi05.so` binding when `pybind11` and `Python.h` are available, and retries without it otherwise |
+| `configure` | Runs CMake with the recipe's flags, `LLAMA_CURL=OFF` and, by default, `GGML_CUDA_FA=OFF`; enables the `pi05.so` binding when `pybind11` and `Python.h` are available, and retries without it otherwise |
 | `build` | Builds `pi05`, `llama-quantize` and, if enabled, `pi05.so`; checks with `ldd` that every library resolves |
 | `download` | Fetches `pi05.gguf`, `tokenizer.model` and `norm_stats.json` of `ActQuant-Pi05-LIBERO-3bpw` at a pinned revision and verifies SHA-256 |
 | `infer` | Runs the `pi05` CLI once on `CUDA0` with a synthetic image and a fixed prompt, and requires finite actions. If the binding was built, it also loads it and runs it twice, for warm latency and repeatability |

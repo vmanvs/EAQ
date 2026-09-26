@@ -83,11 +83,11 @@ int main() {
 }
 """
 TIMEOUTS = {"configure": 15 * 60, "build": 3 * 60 * 60, "infer": 20 * 60}
-# Molab gives each notebook 4 CPUs and 32 GiB, but its sandbox reports the host's 20 CPUs and
-# 160 GiB. Builds using all 4 CPUs (or more jobs) lost the notebook connection within minutes
-# while using little memory, so the default leaves two CPUs for the notebook server and the
-# sandbox, and the build runs at low priority.
-DEFAULT_MAX_JOBS = 2
+# Molab resets the whole sandbox partway through long builds, while memory use stays low; builds
+# with more parallel jobs got further (20 jobs: step 232 of 234; 2 jobs: about 51), which looks
+# like a time budget. So the default favours speed: as many jobs as reported CPUs, limited by
+# memory. The build runs at low priority so the notebook server keeps getting CPU time.
+DEFAULT_MAX_JOBS = 16
 GIB_PER_JOB = 4
 BUILD_NICENESS = 10
 
@@ -135,6 +135,13 @@ def _meminfo():
         return {}
 
 
+def _uptime():
+    try:
+        return float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def _tree_gib(root):
     """Total size of the files under root, without following links; None if missing."""
     if not os.path.isdir(root):
@@ -166,10 +173,10 @@ def resource_sample(with_files=False):
                 pass
         sample["processes"] = processes
         sample["processes_rss_gib"] = round(pages * os.sysconf("SC_PAGE_SIZE") / 2**30, 1)
-        try:
-            sample["load_1min"] = float(Path("/proc/loadavg").read_text(encoding="utf-8").split()[0])
-        except (OSError, ValueError, IndexError):
-            pass
+        # gVisor leaves /proc/loadavg at zero; its /proc/uptime is the sandbox's, which dates resets.
+        uptime = _uptime()
+        if uptime is not None:
+            sample["uptime_min"] = round(uptime / 60, 1)
     meminfo = _meminfo()
     for field, key in (("MemAvailable", "available_gib"), ("MemFree", "free_gib"),
                        ("Cached", "cached_gib"), ("Shmem", "shmem_gib"), ("AnonPages", "anon_gib")):
@@ -216,7 +223,7 @@ class ResourceWatch:
                 count += 1
                 handle.write(json.dumps({"time": dt.datetime.now().strftime("%H:%M:%S"), **sample}) + "\n")
                 handle.flush()
-                for key in ("processes_rss_gib", "load_1min", "processes", "cached_gib", "shmem_gib",
+                for key in ("processes_rss_gib", "processes", "cached_gib", "shmem_gib",
                             "tmp_files_gib", "cgroup_used_gib"):
                     if sample.get(key) is not None:
                         self.peaks[key] = max(sample[key], self.peaks.get(key, sample[key]))
@@ -408,6 +415,7 @@ class Builder:
             "actquant": {"url": ACTQUANT_URL, "commit": ACTQUANT_COMMIT},
             "checkpoint": {"repo": CHECKPOINT_REPO, "revision": CHECKPOINT_REVISION},
             "options": {"stages": args.stages, "cuda_arch": self.arch, "no_vmm": args.no_vmm,
+                        "no_flash_attn": args.no_flash_attn,
                         "jobs": args.jobs, "cpu_check": args.cpu_check, "prompt": args.prompt,
                         "work_dir": str(self.work)},
             "host": self._host(),
@@ -418,7 +426,8 @@ class Builder:
     def _suffix(self):
         # One tree per architecture, toolkit version and VMM setting: CMake cannot switch compilers in place.
         version = (self.toolkit or {}).get("version") or "none"
-        return f"sm{self.arch}-cu{version}" + ("-novmm" if self.args.no_vmm else "")
+        return (f"sm{self.arch}-cu{version}" + ("-novmm" if self.args.no_vmm else "")
+                + ("-nofa" if self.args.no_flash_attn else ""))
 
     @property
     def build_dir(self):
@@ -451,6 +460,7 @@ class Builder:
             cpus = os.cpu_count()
         return {"python": sys.version.split()[0], "executable": sys.executable,
                 "platform": platform.platform(), "cpus": cpus, "cpu_quota": cpu_quota(),
+                "uptime_min_at_start": round(_uptime() / 60, 1) if _uptime() is not None else None,
                 "memory_gib": memory, "disk": disk,
                 "gpu": self.gpu, "tools": {name: self._tool_version(name) for name in ("cmake", "ninja", "gcc", "git")},
                 "packages": {name: _package_version(name) for name in (
@@ -703,7 +713,8 @@ class Builder:
                 "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
                 "-DLLAMA_CURL=OFF",
                 f"-DPython_EXECUTABLE={sys.executable}",
-                *(["-DGGML_CUDA_NO_VMM=ON"] if self.args.no_vmm else [])]
+                *(["-DGGML_CUDA_NO_VMM=ON"] if self.args.no_vmm else []),
+                *(["-DGGML_CUDA_FA=OFF"] if self.args.no_flash_attn else [])]
         log_path = self.output / "configure.log"
         attempts = []
         result = _stream([*base, f"-DBUILD_PI05_PYTHON={'ON' if binding else 'OFF'}"], log_path,
@@ -733,6 +744,9 @@ class Builder:
                                "headers are not assumed.")
         if self.args.no_vmm:
             self.deviation("vmm", "GGML_CUDA_NO_VMM=ON: CUDA virtual memory management disabled.")
+        if self.args.no_flash_attn:
+            self.deviation("flash_attn", "GGML_CUDA_FA=OFF: ggml's FlashAttention CUDA kernels compiled as "
+                           "stubs to shorten the build (tools/pi0.5 never calls ggml_flash_attn_ext).")
         self.deviation("binding", f"pi05.so built for Python {platform.python_version()} "
                                   "(ActQuant's policy server uses Python 3.11)." if binding else
                        "pi05.so not built: " + "; ".join(binding_reasons))
@@ -742,8 +756,8 @@ class Builder:
         if self.args.jobs:
             return self.args.jobs
         host = self.report["host"]
-        # The reported CPU count is the host's; the cgroup quota, when visible, is the real one.
-        cpus = max(1, int(host["cpu_quota"] or host["cpus"] or DEFAULT_MAX_JOBS) - 2)
+        # The cgroup quota, when visible, is the real CPU count; otherwise use what is reported.
+        cpus = int(host["cpu_quota"] or host["cpus"] or DEFAULT_MAX_JOBS)
         memory = host["memory_gib"] or {}
         budgets = [value for value in (memory.get("MemAvailable"), memory.get("cgroup_limit_gib")) if value]
         # CUDA template instances take 2-4 GiB each to compile.
@@ -956,8 +970,10 @@ def main():
                         default=Path(__file__).resolve().parents[1] / "requirements" / "actquant-cuda-toolkit.txt",
                         help="Pinned CUDA toolkit wheels installed by the toolkit stage.")
     parser.add_argument("--cuda-arch", help="Override the GPU architecture, e.g. 120.")
-    parser.add_argument("--jobs", type=int, help=f"Parallel build jobs (default: CPUs minus 2, limited by memory, at most {DEFAULT_MAX_JOBS}).")
+    parser.add_argument("--jobs", type=int, help=f"Parallel build jobs (default: CPUs, limited by memory, at most {DEFAULT_MAX_JOBS}).")
     parser.add_argument("--no-vmm", action="store_true", help="Build with GGML_CUDA_NO_VMM=ON.")
+    parser.add_argument("--no-flash-attn", action="store_true",
+                        help="Build with GGML_CUDA_FA=OFF (FlashAttention kernels as stubs; shorter build).")
     parser.add_argument("--no-binding", action="store_true", help="Do not build the pi05.so Python binding.")
     parser.add_argument("--cpu-check", action="store_true", help="Also run the CLI on CPU and compare.")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
