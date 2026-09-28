@@ -161,12 +161,17 @@ def main():
     print(f"[local] run {run}; copies go to {local_runs / run}", flush=True)
 
     while True:
-        result = colab("exec", "-s", args.session, "--timeout", str(args.watch_minutes * 60 + 600),
-                       stdin=WATCH.format(run=run, remote=REMOTE, minutes=args.watch_minutes),
-                       capture=True, check=False)
-        text = result.stdout + result.stderr
-        print("".join(line + "\n" for line in text.splitlines() if not line.startswith("EAQ_WATCH")), end="", flush=True)
-        marker = next((line for line in text.splitlines() if line.startswith("EAQ_WATCH ")), None)
+        watch = subprocess.Popen(["colab", "exec", "-s", args.session, "--timeout", str(args.watch_minutes * 60 + 600)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        watch.stdin.write(WATCH.format(run=run, remote=REMOTE, minutes=args.watch_minutes))
+        watch.stdin.close()
+        marker = None
+        for line in watch.stdout:  # the run's log, streamed as the cell prints it
+            if line.startswith("EAQ_WATCH "):
+                marker = line.strip()
+            else:
+                print(line, end="", flush=True)
+        watch.wait()
         if marker is None:
             if args.session not in colab("sessions", capture=True, check=False).stdout:
                 print(f"[local] session {args.session} is gone; the last copy is in {local_runs / run}")
