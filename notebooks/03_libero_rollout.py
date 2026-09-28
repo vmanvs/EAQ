@@ -257,9 +257,15 @@ def _(
 @app.cell
 def _(mo):
     stage_picker = mo.ui.multiselect(
-        options=["runtime", "client", "server", "rollout"],
+        options=["runtime", "client", "server", "rollout", "hold"],
         value=["runtime", "client", "server", "rollout"],
-        label="Stages (always run in this order)",
+        label="Stages (always run in this order; `hold` is a diagnostic, run it on its own)",
+    )
+    hold_picker = mo.ui.dropdown(
+        options={"idle: the script only sleeps": "idle",
+                 "server: GPU policy server answering requests, no simulator": "server"},
+        value="idle: the script only sleeps",
+        label="Hold stage (15 min, logs sandbox uptime)",
     )
     suite_picker = mo.ui.multiselect(
         options=["libero_spatial", "libero_object", "libero_goal", "libero_10"],
@@ -281,8 +287,9 @@ def _(mo):
         kind="danger",
         tooltip="Stops the running script; it shuts the policy server down and saves its report.",
     )
-    mo.vstack([stage_picker, suite_picker, trials_picker, mo.hstack([run_rollout, stop_rollout], justify="start")])
-    return run_rollout, stage_picker, stop_rollout, suite_picker, trials_picker
+    mo.vstack([stage_picker, suite_picker, trials_picker, hold_picker,
+               mo.hstack([run_rollout, stop_rollout], justify="start")])
+    return hold_picker, run_rollout, stage_picker, stop_rollout, suite_picker, trials_picker
 
 
 @app.cell
@@ -291,6 +298,7 @@ def _(
     datetime,
     eaq_commit,
     fetch_error,
+    hold_picker,
     json,
     os,
     repository_root,
@@ -351,6 +359,7 @@ def _(
                 "--stages", *stage_picker.value,
                 "--suites", *(suite_picker.value or ["libero_spatial"]),
                 "--trials", trials_picker.value,
+                "--hold-mode", hold_picker.value,
                 "--actquant-script", str(repository_root / "scripts" / "actquant_build.py"),
                 "--toolkit-requirements", str(_requirements / "actquant-cuda-toolkit.txt"),
                 "--prebuilt-pin", str(_requirements / "actquant-prebuilt.json"),
@@ -431,6 +440,12 @@ def _(
         return mo.vstack([mo.image(src=path.read_bytes(), width=256), mo.md(caption)]) if path.is_file() else None
 
     _items = [mo.md(launch["notice"])] if launch["notice"] else []
+    try:  # gVisor's /proc/uptime is the sandbox's: it restarts from zero after a Molab reset
+        _uptime = float(Path("/proc/uptime").read_text().split()[0]) / 60
+        _items.append(mo.md(f"Sandbox uptime: **{_uptime:.1f} min** "
+                            f"(checked {datetime.now(timezone.utc):%H:%M:%S} UTC)"))
+    except (OSError, ValueError, IndexError):
+        pass
     _last = read_json(last_run_file)
     if _last is None:
         _items.append(mo.md("No run yet. Choose settings and click **Run LIBERO rollout**."))

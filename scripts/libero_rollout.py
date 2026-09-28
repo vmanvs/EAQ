@@ -62,7 +62,8 @@ SERVE_POLICY_SHA256 = "a82c2671209e28df052c5926558b3d642a9ad102b6e2afc34bb2fed98
 CHECKPOINT_SUBDIR = Path("checkpoints") / "actquant-pi05-libero-3bpw"
 CLIENT_PYTHON = "3.8"
 FLOW_STEPS = 10  # run_libero_eval.sh: FLOW_STEPS=10
-STAGES = ("runtime", "client", "server", "rollout")
+STAGES = ("runtime", "client", "server", "rollout", "hold")
+DEFAULT_STAGES = ("runtime", "client", "server", "rollout")  # "hold" is a diagnostic, run on its own
 SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 TASKS_PER_SUITE = 10
 # Success rates on the checkpoint's model card (500 trials per suite, pi05.so binding).
@@ -162,8 +163,17 @@ with connect(uri, compression=None, max_size=None, open_timeout=60) as websocket
             print("EAQ_PROBE " + json.dumps({"server_error": reply[-3000:]}))
             sys.exit(1)
         outputs.append(msgpack.unpackb(reply, object_hook=unpack))
+    # Optional: keep requesting for argv[4] seconds, at about a rollout's pace (the "hold" stage).
+    hold_until, hold_requests = time.monotonic() + (float(sys.argv[4]) if len(sys.argv) > 4 else 0), 0
+    while time.monotonic() < hold_until:
+        websocket.send(msgpack.packb(pack(observation)))
+        if isinstance(websocket.recv(), str):
+            print("EAQ_PROBE " + json.dumps({"server_error": "error reply during hold"}))
+            sys.exit(1)
+        hold_requests += 1
+        time.sleep(0.25)
 actions = np.asarray(outputs[-1]["actions"], dtype=np.float64)
-print("EAQ_PROBE " + json.dumps({
+print("EAQ_PROBE " + json.dumps({"hold_requests": hold_requests,
     "metadata": metadata, "image": source, "actions_shape": list(actions.shape),
     "finite": bool(np.isfinite(actions).all()), "min": float(actions.min()), "max": float(actions.max()),
     "first_action": [round(float(v), 4) for v in actions[0]],
@@ -908,6 +918,54 @@ class Rollout:
                                      "venv.")
         return details
 
+    def stage_hold(self):
+        """Diagnostic: keep the sandbox in one controlled state for --hold-minutes, logging uptime.
+
+        idle: this script only sleeps. server: the policy server on the GPU answers a request about
+        every 0.3 s, with no simulator. Comparing which of these outlives a Molab reset separates
+        the platform from the parts of a rollout.
+        """
+        seconds = self.args.hold_minutes * 60
+        mode = self.args.hold_mode
+        log(f"hold: {mode} for {self.args.hold_minutes} min, sandbox uptime {_uptime_minutes()} min")
+        details = {"mode": mode, "minutes": self.args.hold_minutes, "uptime_min_start": _uptime_minutes()}
+        self.report["stages"]["hold"].update(details)
+        self.save()
+        probe = None
+        if mode == "server":
+            bin_dir, _ = self._package()
+            port = _free_port(self.args.port)
+            self._start_server(port)
+            probe_script = self.libero_root / "server_probe.py"
+            probe_script.write_text(SERVER_PROBE, encoding="utf-8")
+            probe = subprocess.Popen(
+                [str(self.libero_root / "server-venv" / "bin" / "python"), str(probe_script),
+                 f"ws://127.0.0.1:{port}", PROBE_PROMPT, str(self.libero_root / "render_probe.png"), str(seconds)],
+                env=_child_env(PYTHONPATH=str(bin_dir)), stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+        monitor = CpuMonitor(self.server_process.pid if self.server_process else None)
+        monitor.poll()
+        started = time.monotonic()
+        while time.monotonic() - started < seconds:
+            if probe is not None and probe.poll() is not None:
+                break
+            if monitor.poll():
+                self.report["stages"]["hold"]["uptime_min_last"] = _uptime_minutes()
+                self.save()
+            time.sleep(2)
+        details["uptime_min_end"] = _uptime_minutes()
+        details["cpu"] = monitor.summary()
+        if probe is not None:
+            output = probe.communicate(timeout=120)[0]
+            self._stop_server()
+            line = next((line for line in output.splitlines() if line.startswith("EAQ_PROBE ")), None)
+            details["probe"] = json.loads(line[len("EAQ_PROBE "):]) if line else None
+            if probe.returncode != 0 or not line or "server_error" in details["probe"]:
+                raise StageError("The policy server stopped answering during the hold.",
+                                 {**details, "probe_output": output[-2500:]})
+        log(f"hold: finished, sandbox uptime {details['uptime_min_end']} min")
+        return details
+
     def stage_rollout(self):
         client = _read_json(self.libero_root / "client.json")
         if not client:
@@ -1030,7 +1088,7 @@ def main():
     parser.add_argument("--output", required=True, help="run folder for report.json and logs")
     parser.add_argument("--work-dir", default=os.environ.get("EAQ_WORK_DIR",
                                                              str(Path(tempfile.gettempdir()) / "eaq-actquant")))
-    parser.add_argument("--stages", nargs="+", choices=STAGES, default=list(STAGES))
+    parser.add_argument("--stages", nargs="+", choices=STAGES, default=list(DEFAULT_STAGES))
     parser.add_argument("--suites", nargs="+", choices=SUITES, default=["libero_spatial"])
     parser.add_argument("--trials", type=int, default=1, help="trials per task (ActQuant uses 50)")
     parser.add_argument("--replan-steps", type=int, default=5)
@@ -1042,6 +1100,9 @@ def main():
                         help="cap for the client's thread pools (OpenMP, BLAS, numba, Mesa llvmpipe)")
     parser.add_argument("--server-threads", type=int, default=2,
                         help="ggml CPU threads in the policy server (the GPU does the model's work)")
+    parser.add_argument("--hold-mode", choices=["idle", "server"], default="idle",
+                        help="the hold stage: sleep only, or keep the GPU policy server answering requests")
+    parser.add_argument("--hold-minutes", type=float, default=15.0)
     parser.add_argument("--suite-hours", type=float, default=10.0, help="time limit per suite")
     parser.add_argument("--actquant-script", default=str(repository / "scripts" / "actquant_build.py"))
     parser.add_argument("--toolkit-requirements", default=str(repository / "requirements" / "actquant-cuda-toolkit.txt"))
