@@ -1,7 +1,11 @@
 # Molab preflight
 
-[Molab](https://molab.marimo.io/) is marimo's hosted notebook service and the
-current target for EAQ experiments. The preflight notebook checks the
+[Molab](https://molab.marimo.io/) is marimo's hosted notebook service and was
+the first target for EAQ experiments. It is no longer used for LIBERO
+rollouts: its sandboxes reset a few minutes after starting, whatever they were
+running (see [LIBERO rollouts](#libero-rollouts)). Rollouts now run on Colab;
+see the [Colab guide](colab.md). The notebooks below still work for short
+checks. The preflight notebook checks the
 environment before any full model download or LIBERO rollout. It is a marimo
 `.py` file; GitHub is the source of truth for its code.
 
@@ -135,8 +139,9 @@ binaries and the `pi05.so` binding load there. It then runs
 
 - **Toolkit:** the private CUDA 13.0 toolkit from the wheels pinned in
   `requirements/actquant-cuda-toolkit.txt`.
-- **No GPU on the runner:** `--no-gpu --cuda-arch 120`. The toolkit probe is
-  compiled but not run.
+- **No GPU on the runner:** `--no-gpu --cuda-arch <arch>`, from the
+  workflow's `cuda_arch` input: 120 for Molab's RTX PRO 6000, 75 for Colab's
+  T4, 89 for an L4. The toolkit probe is compiled but not run.
 - **No VMM:** `--no-vmm` (`GGML_CUDA_NO_VMM=ON`). ggml links the CUDA driver
   library only for virtual memory management, and the runner has no driver.
   ggml then allocates GPU memory without VMM.
@@ -154,9 +159,10 @@ binaries and the `pi05.so` binding load there. It then runs
   from the installed package (a workflow input, on by default).
 
 A second job publishes the tarball, its `.sha256` and `report.json` as a
-GitHub release. The run summary shows a pin to copy into
-`requirements/actquant-prebuilt.json`. Once the pin is committed, notebook 02
-uses the new package. The fetch stage refuses a download whose SHA-256
+GitHub release. The run summary shows a pin to copy into the pin file for that
+architecture: `requirements/actquant-prebuilt.json` for sm_120 (Molab),
+`actquant-prebuilt-sm75.json` for the T4 and `actquant-prebuilt-sm89.json` for
+the L4. Once the sm_120 pin is committed, notebook 02 uses the new package. The fetch stage refuses a download whose SHA-256
 differs from the pin.
 
 ### Running on Molab
@@ -225,9 +231,10 @@ SHA-256 digests in `scripts/libero_rollout.py`.
 | Stage | What it does |
 | --- | --- |
 | `runtime` | Runs `actquant_build.py --stages toolkit fetch download`: the CUDA runtime, the pinned package and the checkpoint, reusing the work folder |
-| `client` | Installs Python 3.8 with uv and `requirements/libero-client.txt` without dependency resolution. Fetches LIBERO at openpi's submodule commit (`f78abd6`) and writes its config file, which LIBERO otherwise asks for on stdin. Renders one `libero_spatial` scene with EGL, then Mesa EGL, then OSMesa; if none works it installs Mesa with apt and tries again |
+| `client` | Installs Python 3.8 with uv and `requirements/libero-client.txt` without dependency resolution. Fetches LIBERO at openpi's submodule commit (`f78abd6`) and writes its config file, which LIBERO otherwise asks for on stdin. Renders one `libero_spatial` scene with EGL, then Mesa EGL, then OSMesa, and records the renderer and time per step; if none works it installs Mesa with apt and tries again |
 | `server` | Creates a venv for the Python `pi05.so` was built for, with `requirements/libero-server.txt`. Starts `serve_policy.py` on `CUDA0` with 10 flow steps, as `run_libero_eval.sh` does, and sends three observations over the openpi protocol |
 | `rollout` | Starts the server and runs `main.py` once per suite with `--args.port`, 5 replan steps and seed 7. Records every episode |
+| `hold` | Diagnostic, run on its own: keeps the sandbox busy for a set time, idle (`--hold-mode idle`) or with the policy server answering requests (`server`), to test whether a session survives |
 
 **Validity.** `serve_policy.py` answers a failed inference with zero actions,
 which it then unnormalizes, so the client cannot tell them from real ones. The
@@ -258,9 +265,15 @@ Other deviations the report records:
 - fewer than 50 trials per task, when chosen;
 - the rendering backend, if it is not EGL.
 
-A full suite at 50 trials per task is 500 episodes and takes hours. Molab
-resets sandboxes that run long jobs, and a reset wipes the work folder and
-the run, so run suites in pieces and download each ZIP.
+**Molab results (2026-09-28/29).** The runtime, client and server stages
+passed, and the first episodes of `libero_spatial` succeeded with the policy
+server on the GPU. Every run, though, ended with the sandbox resetting 2–4
+minutes after it started, which wipes the work folder and the run. Capping the
+client's threads (`--client-threads`) did not help, and CPU load stayed near
+one core. A `hold` stage, which only sleeps or only serves the policy, reset
+the same way. The resets are therefore Molab's, not the workload's, and
+rollouts moved to [Colab](colab.md). `scripts/libero_rollout.py` is not
+Molab-specific and runs there unchanged.
 
 Molab documentation: [GitHub mirroring and server previews](https://docs.marimo.io/guides/molab/#mirror-notebooks-from-github),
 [GPU and session limits](https://docs.marimo.io/guides/molab/#compute), and

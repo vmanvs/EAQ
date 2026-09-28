@@ -40,4 +40,5 @@ saved as notebook outputs or downloaded to survive session removal.
 | Public metadata failed | Check Internet and service availability. |
 
 A pass is permission to investigate model loading, not evidence of model fit or
-successful robot control. Full inference and LIBERO evaluation remain pending.
+successful robot control. LIBERO evaluation now runs on Colab; see the
+[Colab guide](colab.md).

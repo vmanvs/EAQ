@@ -22,7 +22,7 @@ allocations will be compared with a universal allocation across conditions.
 
 ## Status
 
-Early research development; no policy baseline or quantization results yet.
+Early research development; no quantization results yet.
 
 The first feasibility target is the released Pi 0.5 pipeline from
 [ActQuant](https://github.com/arashakb/ActQuant) on LIBERO. ActQuant allocates
@@ -30,30 +30,37 @@ precision by action sensitivity, which makes it the natural action-sensitive
 comparison and starting point for this study. World-action models such as
 [LaWAM](https://github.com/RLinf/LaWAM) remain a later target.
 
-As of 2026-09-25 the Molab environment check reports
-`ready_with_adaptations` for that pipeline: its CUDA code can be compiled for
-and run on Molab's Blackwell GPU, with recorded deviations from ActQuant's
-documented setup. The next milestone is building ActQuant there and running a
-single inference with its released 3-bit checkpoint, followed by a
-reference-precision LIBERO rollout.
+As of 2026-09-29, ActQuant's released 3-bit Pi 0.5 checkpoint runs closed-loop
+on LIBERO through ActQuant's policy server and openpi's LIBERO client, both
+unmodified, on a free Google Colab T4. A 10-episode `libero_spatial` smoke run
+succeeded in 10 of 10 episodes. That shows the pipeline works; it is not yet a
+baseline measurement. The next milestone is reproducing ActQuant's reported
+success rates over full suites (50 trials per task), which first needs faster
+simulation: an episode currently takes about 88 s, mostly CPU rendering.
 
 ## Cloud validation
 
-Experiments run on [Molab](https://molab.marimo.io/), marimo's hosted notebook
-service. [The Molab preflight notebook](notebooks/01_molab_preflight.py) checks
-GPU execution, headless rendering, model access, and whether ActQuant's
-pipeline can be built, before any large download. See the
-[Molab guide](docs/molab.md) for running it, the observed environment, and the
-resulting build recipe. It validates infrastructure only; it does not run a
-policy or benchmark. ActQuant's Pi 0.5 runtime is compiled by
-[a GitHub Actions workflow](.github/workflows/actquant-build.yml) in a
-Molab-matching container and published as a release. [The ActQuant runtime
-notebook](notebooks/02_actquant_build.py) fetches that pinned package, downloads
-the released 3-bit checkpoint, and runs one CUDA inference as a smoke test. [The LIBERO rollout
-notebook](notebooks/03_libero_rollout.py) then evaluates that checkpoint in
-closed loop, through ActQuant's policy server and openpi's LIBERO client, both
-unmodified. The earlier [Kaggle preflight](docs/kaggle.md) remains
-available as an alternative.
+ActQuant's Pi 0.5 runtime is compiled by
+[a GitHub Actions workflow](.github/workflows/actquant-build.yml) and
+published as a release, one build per GPU architecture. Cloud GPU hosts only
+download and run it.
+
+- **LIBERO rollouts: Google Colab.** `cloud/colab_libero.py` runs
+  [the rollout script](scripts/libero_rollout.py) on a Colab T4 through the
+  Colab CLI and copies each run back. See the [Colab guide](docs/colab.md).
+- **Environment checks: Molab.** [Molab](https://molab.marimo.io/), marimo's
+  hosted notebook service, was the first target.
+  - [The preflight notebook](notebooks/01_molab_preflight.py) checks GPU
+    execution, headless rendering, model access, and whether ActQuant's
+    pipeline can be built.
+  - [The runtime notebook](notebooks/02_actquant_build.py) fetches the pinned
+    package, downloads the 3-bit checkpoint, and runs one CUDA inference.
+  - [The LIBERO rollout notebook](notebooks/03_libero_rollout.py) ran the
+    first successful episodes. Molab's sandboxes reset a few minutes after
+    starting, so rollouts moved to Colab. See the [Molab guide](docs/molab.md).
+- **Other options.** `cloud/modal_libero.py` targets Modal's L4 GPUs; it
+  needs a payment method on the Modal account and has not been run. The earlier
+  [Kaggle preflight](docs/kaggle.md) remains available.
 
 ## Experimental approach
 
