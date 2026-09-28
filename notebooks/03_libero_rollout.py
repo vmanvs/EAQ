@@ -535,8 +535,13 @@ def _(
                 _server = _stages.get("server") or {}
                 _checks = []
                 if _client.get("render"):
-                    _checks.append(f"- Rendering: `{_client['gl']}`, {_client['render']['step_ms']} ms per "
-                                   f"simulator step; Python `{_client.get('python')}`")
+                    _renderer = _client["render"].get("renderer") or "renderer not recorded"
+                    _checks.append(f"- Rendering: `{_client['gl']}` ({_renderer}), {_client['render']['step_ms']} ms "
+                                   f"per simulator step; Python `{_client.get('python')}`")
+                _cpu = (_stages.get("rollout") or {}).get("cpu") or {}
+                if _cpu:
+                    _checks.append(f"- CPU during the rollout: median {_cpu['cores_median']} cores, max "
+                                   f"{_cpu['cores_max']} (policy server max {_cpu['server_cores_max']})")
                 if (_server.get("probe") or {}).get("actions_shape"):
                     _probe = _server["probe"]
                     _checks.append(f"- Policy server: actions `{_probe['actions_shape']}`, range "

@@ -108,10 +108,16 @@ for _ in range(20):
 stepped = time.monotonic()
 image = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])  # as main.py sends it
 imageio.imwrite(sys.argv[1], image)
+renderer = None
+try:  # "llvmpipe" means Mesa rendering on the CPU; an NVIDIA name means the GPU renders
+    from OpenGL.GL import GL_RENDERER, GL_VENDOR, glGetString
+    renderer = " / ".join(glGetString(name).decode() for name in (GL_VENDOR, GL_RENDERER))
+except Exception as exc:
+    renderer = f"unknown ({type(exc).__name__})"
 env.close()
 print("EAQ_PROBE " + json.dumps({
     "task": task.language, "n_tasks": suite.n_tasks, "init_states": len(init_states),
-    "image_shape": list(image.shape), "image_std": float(image.std()),
+    "image_shape": list(image.shape), "image_std": float(image.std()), "renderer": renderer,
     "setup_seconds": round(ready - started, 1), "step_ms": round((stepped - ready) * 50, 1)}))
 '''
 
@@ -186,6 +192,73 @@ def _now():
 # running another interpreter must not inherit them: uv's Python 3.8 build environment imported the
 # notebook's 3.13-only `packaging` and failed to build openpi-client.
 INHERITED_PYTHON_VARS = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE", "VIRTUAL_ENV")
+
+
+# Thread pools in the client that otherwise size themselves to the 20 CPUs gVisor reports (Molab has
+# about 4 real ones). Sustained all-core load is the best explanation for Molab's sandbox resets.
+THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+               "NUMBA_NUM_THREADS", "LP_NUM_THREADS")  # LP_: Mesa llvmpipe's rendering threads
+
+
+def _cpu_seconds(pid="self"):
+    """CPU seconds (user + system) of one process, or None."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+
+
+def _uptime_minutes():
+    try:
+        return round(float(Path("/proc/uptime").read_text().split()[0]) / 60, 1)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+class CpuMonitor:
+    """Cores in use by all processes (from /proc), logged every `every` seconds."""
+
+    def __init__(self, server_pid, every=30):
+        self.server_pid, self.every = server_pid, every
+        self.last = None
+        self.samples = []
+
+    @staticmethod
+    def _total():
+        total = 0.0
+        for entry in Path("/proc").iterdir():
+            if entry.name.isdigit():
+                total += _cpu_seconds(entry.name) or 0.0
+        return total
+
+    def poll(self):
+        now = time.monotonic()
+        if self.last is not None and now - self.last[0] < self.every:
+            return None
+        try:
+            current = (now, self._total(), _cpu_seconds(self.server_pid) or 0.0)
+        except OSError:
+            return None
+        previous, self.last = self.last, current
+        if previous is None:
+            return None
+        wall = current[0] - previous[0]
+        # Exited processes drop out of the total, so a sample can dip; clamp at zero.
+        sample = {"uptime_min": _uptime_minutes(),
+                  "cores_all": round(max(current[1] - previous[1], 0.0) / wall, 2),
+                  "cores_server": round(max(current[2] - previous[2], 0.0) / wall, 2)}
+        self.samples.append(sample)
+        log(f"cpu: {sample['cores_all']} cores in use ({sample['cores_server']} policy server), "
+            f"sandbox uptime {sample['uptime_min']} min")
+        return sample
+
+    def summary(self):
+        if not self.samples:
+            return {}
+        cores = sorted(sample["cores_all"] for sample in self.samples)
+        return {"samples": len(cores), "cores_median": cores[len(cores) // 2], "cores_max": cores[-1],
+                "server_cores_max": max(sample["cores_server"] for sample in self.samples)}
 
 
 def _child_env(**overrides):
@@ -618,6 +691,7 @@ class Rollout:
         env["PYTHONPATH"] = str(self.libero_root / "LIBERO")
         env["TQDM_DISABLE"] = "1"  # main.py's progress bars only garble the log
         env["PYTHONUNBUFFERED"] = "1"
+        env.update({name: str(self.args.client_threads) for name in THREAD_VARS})
         for name, extra in GL_CANDIDATES:
             if name == gl_name:
                 env["MUJOCO_GL"] = name.split("-")[0]
@@ -737,7 +811,7 @@ class Rollout:
         env["PYTHONPATH"] = str(bin_dir)  # as run_libero_eval.sh: the folder holding pi05.so
         env["PYTHONUNBUFFERED"] = "1"
         command = [python, serve, "--model-dir", self.checkpoint, "--host", "127.0.0.1", "--port", port,
-                   "--device", self.args.device, "--steps", FLOW_STEPS]
+                   "--device", self.args.device, "--steps", FLOW_STEPS, "--threads", self.args.server_threads]
         log_path = self.output / log_name
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(f"$ {' '.join(str(part) for part in command)}\n")
@@ -843,6 +917,8 @@ class Rollout:
         port = _free_port(self.args.port)
         server_log = ServerLog(self.output / "server.log")
         log_path = self._start_server(port)
+        monitor = CpuMonitor(self.server_process.pid)
+        monitor.poll()
         episodes_path = self.output / "episodes.jsonl"
         progress_path = self.output / "progress.json"
         total_expected = TASKS_PER_SUITE * self.args.trials * len(self.args.suites)
@@ -877,6 +953,9 @@ class Rollout:
 
             def stop():
                 server_log.poll()
+                sample = monitor.poll()
+                if sample:
+                    progress["cpu"] = sample
                 write_progress()
                 if self.server_process is None or self.server_process.poll() is not None:
                     return "policy server exited"
@@ -938,7 +1017,8 @@ class Rollout:
                                      "instead of ActQuant's 50; success rates are far less precise.")
         self.deviation("launcher", "One policy server on one GPU and openpi's main.py with --args.port; "
                                    "ActQuant's run_libero_eval.sh shards tasks over one server per GPU (--args.ports).")
-        details = {"results": results, "port": port, "server": server_total}
+        details = {"results": results, "port": port, "server": server_total, "cpu": monitor.summary(),
+                   "threads": {"client": self.args.client_threads, "server": self.args.server_threads}}
         if problems:
             raise StageError("Rollout invalid: " + "; ".join(problems) + ".", details)
         return details
@@ -958,6 +1038,10 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--device", default="CUDA0", help="ggml device for the policy server")
     parser.add_argument("--gl", default="auto", choices=["auto", *(name for name, _ in GL_CANDIDATES)])
+    parser.add_argument("--client-threads", type=int, default=1,
+                        help="cap for the client's thread pools (OpenMP, BLAS, numba, Mesa llvmpipe)")
+    parser.add_argument("--server-threads", type=int, default=2,
+                        help="ggml CPU threads in the policy server (the GPU does the model's work)")
     parser.add_argument("--suite-hours", type=float, default=10.0, help="time limit per suite")
     parser.add_argument("--actquant-script", default=str(repository / "scripts" / "actquant_build.py"))
     parser.add_argument("--toolkit-requirements", default=str(repository / "requirements" / "actquant-cuda-toolkit.txt"))
