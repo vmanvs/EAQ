@@ -995,7 +995,8 @@ class Builder:
             details["binding_note"] = (f"pi05.so was built for Python {python}; this is "
                                        f"{platform.python_version()}, so it will not import.")
         for index, text in enumerate(manifest.get("deviations", [])):
-            self.deviation(f"package_{index}", text)
+            if not text.startswith("CUDA toolkit"):  # the build host's; the toolkit stage records this host's
+                self.deviation(f"package_{index}", text)
         self.deviation("prebuilt", f"Runtime not compiled here: release {pin['tag']} of {pin['repository']}, "
                                    "built by the EAQ GitHub Actions workflow.")
         return details

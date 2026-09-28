@@ -182,6 +182,18 @@ def _now():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+# Interpreter settings of the notebook's own Python (Molab puts its 3.13 venv on PYTHONPATH). A child
+# running another interpreter must not inherit them: uv's Python 3.8 build environment imported the
+# notebook's 3.13-only `packaging` and failed to build openpi-client.
+INHERITED_PYTHON_VARS = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE", "VIRTUAL_ENV")
+
+
+def _child_env(**overrides):
+    env = {key: value for key, value in os.environ.items() if key not in INHERITED_PYTHON_VARS}
+    env.update(overrides)
+    return env
+
+
 def _run(command, timeout=60, cwd=None, env=None):
     try:
         result = subprocess.run([str(part) for part in command], capture_output=True, text=True,
@@ -447,7 +459,7 @@ class Rollout:
         return uv
 
     def _uv_env(self):
-        env = os.environ.copy()
+        env = _child_env()
         # uv-managed interpreters (Python 3.8 for the client) live in the work folder.
         env["UV_PYTHON_INSTALL_DIR"] = str(self.libero_root / "python")
         return env
@@ -583,8 +595,7 @@ class Rollout:
             command += ["--toolkit-requirements", self.args.toolkit_requirements]
         if self.args.prebuilt_pin:
             command += ["--prebuilt-pin", self.args.prebuilt_pin]
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}  # the notebook's own interpreter: keep its settings
         result = _stream(command, self.output / "runtime.log", 3600, env=env)
         report = _read_json(runtime_output / "report.json") or {}
         stages = {name: entry.get("status") for name, entry in report.get("stages", {}).items()}
@@ -601,7 +612,7 @@ class Rollout:
     def _client_env(self, gl_name=None):
         client = _read_json(self.libero_root / "client.json") or {}
         gl_name = gl_name or client.get("gl")
-        env = os.environ.copy()
+        env = _child_env()
         # LIBERO asks on stdin for a dataset path unless its config file exists.
         env["LIBERO_CONFIG_PATH"] = str(self.libero_root / "config")
         env["PYTHONPATH"] = str(self.libero_root / "LIBERO")
@@ -680,7 +691,7 @@ class Rollout:
                 log("no rendering backend worked; installing Mesa EGL/OSMesa with apt-get")
                 update = _run([apt, "update"], timeout=900)
                 result = _run([apt, "install", "-y", "--no-install-recommends", *GL_APT_PACKAGES], timeout=1800,
-                              env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
+                              env=_child_env(DEBIAN_FRONTEND="noninteractive"))
                 attempts.append({"apt_install": list(GL_APT_PACKAGES), "returncode": result["returncode"],
                                  "update_returncode": update["returncode"], "output_tail": result["output"][-1500:]})
                 if result["returncode"] != 0:
@@ -722,7 +733,7 @@ class Rollout:
             raise StageError("The policy server is not installed; run the server stage.")
         if not (self.checkpoint / "pi05.gguf").is_file():
             raise StageError(f"No checkpoint at {self.checkpoint}; run the runtime stage.")
-        env = os.environ.copy()
+        env = _child_env()
         env["PYTHONPATH"] = str(bin_dir)  # as run_libero_eval.sh: the folder holding pi05.so
         env["PYTHONUNBUFFERED"] = "1"
         command = [python, serve, "--model-dir", self.checkpoint, "--host", "127.0.0.1", "--port", port,
@@ -779,7 +790,7 @@ class Rollout:
         requirements = self._install_requirements(python, Path(self.args.server_requirements),
                                                   self.libero_root / "server-venv" / ".eaq-requirements")
         serve = _download(SERVE_POLICY_URL, self.libero_root / "actquant" / "serve_policy.py", SERVE_POLICY_SHA256)
-        env = {**os.environ, "PYTHONPATH": str(bin_dir)}
+        env = _child_env(PYTHONPATH=str(bin_dir))
         imports = _run([python, "-c", "import sys, pi05, numpy, cv2, websockets, msgpack; print(sys.version.split()[0], "
                         "numpy.__version__, cv2.__version__, websockets.__version__, msgpack.version)"],
                        timeout=120, env=env)
