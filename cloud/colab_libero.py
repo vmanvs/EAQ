@@ -34,8 +34,9 @@ REPO = Path(__file__).resolve().parents[1]
 PIN = "actquant-prebuilt-sm75.json"  # the T4 is sm_75
 UPLOADS = ("scripts/libero_rollout.py", "scripts/actquant_build.py", f"requirements/{PIN}",
            "requirements/actquant-cuda-toolkit.txt", "requirements/libero-client.txt",
-           "requirements/libero-server.txt")
+           "requirements/libero-server.txt", "requirements/fp16-export.txt")
 REMOTE = "/content/eaq"
+DRIVE_CACHE = "/content/drive/MyDrive/eaq-cache"
 SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 STAGES = ("runtime", "client", "server", "profile", "rollout")
 
@@ -120,6 +121,11 @@ def main():
     parser.add_argument("--stages", default="runtime,client,server,rollout",
                         help="libero_rollout.py stages, comma-separated; add 'profile' to time inference first")
     parser.add_argument("--profile-requests", type=int, default=20, help="requests per phase of the profile stage")
+    parser.add_argument("--model", choices=["actquant-3bpw", "fp16"], default="actquant-3bpw",
+                        help="the released 3-bit checkpoint, or the FP16 reference (exported on the VM)")
+    parser.add_argument("--drive", action="store_true",
+                        help="mount Google Drive (colab drivemount) and keep the FP16 export in "
+                             f"{DRIVE_CACHE}, so later sessions copy it instead of exporting again")
     parser.add_argument("--session", default="eaq-libero")
     parser.add_argument("--attach", metavar="RUN", help="watch a run already started in --session")
     parser.add_argument("--keep", action="store_true", help="leave the session running at the end")
@@ -152,12 +158,17 @@ def main():
     if args.attach:
         run = args.attach
     else:
-        run = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S") + f"-t{args.trials}"
+        run = (dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S") + f"-t{args.trials}"
+               + ("-fp16" if args.model == "fp16" else ""))
         colab("exec", "-s", args.session, stdin=f"import os\nfor d in ('scripts', 'requirements', 'runs'): "
                                                   f"os.makedirs('{REMOTE}/' + d, exist_ok=True)\n")
         for path in UPLOADS:
             colab("upload", "-s", args.session, str(REPO / path), f"{REMOTE}/{path}")
-        rollout_args = ["--stages", *stages, "--profile-requests", str(args.profile_requests),
+        if args.drive:
+            print("[local] mounting Google Drive; approve the request if one appears", flush=True)
+            colab("drivemount", "-s", args.session, "/content/drive")
+        rollout_args = ["--model", args.model, *(["--model-cache", DRIVE_CACHE] if args.drive else []),
+                        "--stages", *stages, "--profile-requests", str(args.profile_requests),
                         "--suites", *suites, "--trials", str(args.trials), "--suite-hours", str(args.suite_hours),
                         "--client-threads", str(args.client_threads), "--server-threads", str(args.server_threads),
                         "--prebuilt-pin", f"{REMOTE}/requirements/{PIN}",
@@ -197,7 +208,7 @@ def main():
             break
 
     report = json.loads((local_runs / run / "report.json").read_text(encoding="utf-8"))
-    print(f"[local] status: {report.get('status')}")
+    print(f"[local] model: {report.get('options', {}).get('model')}, status: {report.get('status')}")
     client = report.get("stages", {}).get("client", {})
     if client.get("render"):
         print(f"[local] rendering: {client.get('gl')}, {client['render'].get('renderer')}, "
@@ -207,7 +218,7 @@ def main():
         print(f"[local] profile {phase}: pi05 total p50 {total} ms, round trip p50 {entry['round_trip_ms']['p50']} ms")
     for suite, result in report.get("stages", {}).get("rollout", {}).get("results", {}).items():
         print(f"[local] {suite}: {result.get('successes')}/{result.get('episodes')} "
-              f"(ActQuant reports {result.get('actquant_reported')}), valid={result.get('valid')}")
+              f"(ActQuant's 3-bit model card: {result.get('actquant_reported')}), valid={result.get('valid')}")
     if not args.keep:
         colab("stop", "-s", args.session, check=False)
     return 0 if report.get("status") == "rollout_ok" else 1

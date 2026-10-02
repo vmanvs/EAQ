@@ -19,7 +19,9 @@ leaves evidence:
              $ORIGIN:$ORIGIN/../cuda/lib, and install that package locally
   fetch      download the pinned release package, verify its SHA-256 and
              install it (the Molab path; replaces source/configure/build/package)
-  download   fetch the pinned 3-bit checkpoint and verify its SHA-256
+  download   fetch the pinned 3-bit checkpoint and verify its SHA-256; with --model fp16,
+             export the FP16 reference from the base checkpoint with ActQuant's
+             export_pi05.py instead (or copy it from --model-cache)
   infer      one inference through the CLI (and the binding, if present),
              from the installed package or else the build tree
 
@@ -50,6 +52,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import sysconfig
@@ -72,6 +75,124 @@ CHECKPOINT_FILES = {
     "tokenizer.model": "8986bb4f423f07f8c7f70d0dbe3526fb2316056c17bae71b1ea975e77a168fc6",
     "norm_stats.json": None,
 }
+# The FP16 reference: ActQuant's export_pi05.py run on the base checkpoint it quantizes. Its 3-bit
+# release is this FP16 file with the PaliGemma LLM swapped for a quantized one (merge_pi05_llm.py).
+BASE_REPO = "lerobot/pi05_libero_finetuned_v044"
+BASE_REVISION = "8e174154ef5f6c60a8da12ae99c303d8963138c1"
+BASE_FILES = {
+    "model.safetensors": "877b3ec1130548b69af7f8aeef3ec9d3fc7738040f0b9beb490857ec970997ae",
+    "config.json": None,
+    "policy_preprocessor.json": None,
+    "policy_preprocessor_step_2_normalizer_processor.safetensors":
+        "a002c0df7f79c5b169c5a899ad151d4ea1bed246c7d82bd93ed1556558d517a9",
+    "policy_postprocessor.json": None,
+    "policy_postprocessor_step_0_unnormalizer_processor.safetensors":
+        "a002c0df7f79c5b169c5a899ad151d4ea1bed246c7d82bd93ed1556558d517a9",
+}
+FP16_SHA256 = None  # pi05.gguf of the FP16 export, once known; later exports and cached copies must match
+MODELS = {"actquant-3bpw": "actquant-pi05-libero-3bpw", "fp16": "pi05-libero-fp16"}  # name: checkpoint folder
+
+# Runs export_pi05.py unmodified, with two memory changes that do not alter its output: the 7.5 GB
+# bf16 state dict is read lazily, one tensor at a time, and GGUFWriter spills tensors to a temporary
+# file instead of keeping all 7 GB of FP16 arrays in RAM. As written it needs about 16-17 GB.
+EXPORT_WRAPPER = r'''
+import runpy, sys
+source, model_dir, output_dir = sys.argv[1:4]
+sys.path[:0] = [f"{source}/tools/pi0.5", f"{source}/gguf-py"]
+import gguf
+import safetensors.torch
+from safetensors import safe_open
+
+
+class LazyStateDict(dict):
+    """A dict (export_pi05.py checks isinstance(st, dict)) that reads each tensor when asked."""
+
+    def __init__(self, path):
+        super().__init__()
+        self._file = safe_open(path, framework="pt")
+        self._keys = list(self._file.keys())
+
+    def __getitem__(self, key):
+        return self._file.get_tensor(key)
+
+    def keys(self):
+        return list(self._keys)
+
+    def __iter__(self):
+        return iter(self._keys)
+
+    def __len__(self):
+        return len(self._keys)
+
+    def __contains__(self, key):
+        return key in self._keys
+
+
+eager = safetensors.torch.load_file
+safetensors.torch.load_file = lambda path, device="cpu": (
+    LazyStateDict(path) if str(path).endswith("model.safetensors") else eager(path, device=device))
+
+
+class TempFileWriter(gguf.GGUFWriter):
+    def __init__(self, *args, **kwargs):
+        kwargs["use_temp_file"] = True
+        super().__init__(*args, **kwargs)
+
+
+gguf.GGUFWriter = TempFileWriter
+script = f"{source}/tools/pi0.5/export_pi05.py"
+sys.argv = [script, "-d", model_dir, "-o", output_dir]
+runpy.run_path(script, run_name="__main__")
+'''
+
+GGUF_TYPES = {0: "F32", 1: "F16", 2: "Q4_0", 8: "Q8_0", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K", 13: "Q5_K",
+              14: "Q6_K", 16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 21: "IQ3_S", 22: "IQ2_S", 30: "BF16"}
+
+
+def gguf_tensor_table(data):
+    """{name: (shape, type)} from the start of a GGUF file (the header and tensor infos only)."""
+    pos = 0
+
+    def take(fmt):
+        nonlocal pos
+        values = struct.unpack_from("<" + fmt, data, pos)
+        pos += struct.calcsize("<" + fmt)
+        return values[0]
+
+    def text():
+        nonlocal pos
+        size = take("Q")
+        pos += size
+        return data[pos - size:pos].decode("utf-8", "replace")
+
+    scalar = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
+
+    def value(kind):
+        if kind == 8:
+            return text()
+        if kind == 9:
+            item, count = take("I"), take("Q")
+            return [value(item) for _ in range(count)]
+        return take(scalar[kind])
+
+    if data[:4] != b"GGUF":
+        raise ValueError("not a GGUF file")
+    pos = 4
+    take("I")  # version
+    n_tensors, n_kv = take("Q"), take("Q")
+    for _ in range(n_kv):
+        text()
+        value(take("I"))
+    table = {}
+    for _ in range(n_tensors):
+        name = text()
+        shape = [take("Q") for _ in range(take("I"))]
+        kind = take("I")
+        take("Q")  # offset
+        table[name] = (shape, GGUF_TYPES.get(kind, str(kind)))
+    return table
+
+
 BUILD_TARGETS = ("pi05", "llama-quantize")
 DEFAULT_PROMPT = "put the black bowl on the plate"
 STAGES = ("toolkit", "source", "configure", "build", "package", "fetch", "download", "infer")
@@ -417,7 +538,7 @@ class Builder:
         self.work = Path(args.work_dir).resolve()
         self.output = Path(args.output).resolve()
         self.source = self.work / "ActQuant"
-        self.checkpoint = self.work / "checkpoints" / "actquant-pi05-libero-3bpw"
+        self.checkpoint = self.work / "checkpoints" / MODELS[args.model]
         self.toolkit_prefix = self.work / "cuda-toolkit"
         self.toolkit = find_toolkit(self.toolkit_prefix)
         self.gpu = gpu_info()
@@ -429,8 +550,10 @@ class Builder:
             "scope": "ActQuant Pi 0.5 build and a single-inference smoke test; no LIBERO rollout",
             "started_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "actquant": {"url": ACTQUANT_URL, "commit": ACTQUANT_COMMIT},
-            "checkpoint": {"repo": CHECKPOINT_REPO, "revision": CHECKPOINT_REVISION},
-            "options": {"stages": args.stages, "cuda_arch": self.arch, "no_vmm": args.no_vmm,
+            "checkpoint": ({"repo": CHECKPOINT_REPO, "revision": CHECKPOINT_REVISION} if args.model != "fp16"
+                           else {"base_repo": BASE_REPO, "base_revision": BASE_REVISION,
+                                 "export": "tools/pi0.5/export_pi05.py (FP16)"}),
+            "options": {"model": args.model,"stages": args.stages, "cuda_arch": self.arch, "no_vmm": args.no_vmm,
                         "no_flash_attn": args.no_flash_attn, "no_gpu": args.no_gpu,
                         "infer_device": args.infer_device,
                         "jobs": args.jobs, "cpu_check": args.cpu_check, "prompt": args.prompt,
@@ -1002,21 +1125,26 @@ class Builder:
         return details
 
     def stage_download(self):
+        if self.args.model == "fp16":
+            return self._fp16_checkpoint()
+        return self._download_release(self.checkpoint, CHECKPOINT_FILES)
+
+    def _download_release(self, folder, files_wanted):
         try:
             from huggingface_hub import HfApi, hf_hub_download
         except ImportError as exc:
             raise StageError("huggingface_hub is not installed.") from exc
-        self.checkpoint.mkdir(parents=True, exist_ok=True)
+        folder.mkdir(parents=True, exist_ok=True)
         token = os.environ.get("HF_TOKEN") or None  # not required: the checkpoint is public
         files = {}
-        for name, expected in CHECKPOINT_FILES.items():
-            target = self.checkpoint / name
+        for name, expected in files_wanted.items():
+            target = folder / name
             if not (target.is_file() and (expected is None or self._sha256(target) == expected)):
                 log(f"downloading {name}")
                 started = time.monotonic()
                 try:
                     path = hf_hub_download(CHECKPOINT_REPO, name, revision=CHECKPOINT_REVISION, token=token,
-                                           local_dir=str(self.checkpoint))
+                                           local_dir=str(folder))
                 except Exception as exc:  # never log tokens or raw HTTP exceptions
                     code = getattr(getattr(exc, "response", None), "status_code", None)
                     raise StageError(f"Download of {name} failed ({type(exc).__name__}, HTTP {code}).")
@@ -1030,7 +1158,197 @@ class Builder:
             resolved = HfApi().model_info(CHECKPOINT_REPO, revision=CHECKPOINT_REVISION, token=token).sha
         except Exception:
             resolved = None
-        return {"path": str(self.checkpoint), "files": files, "revision_resolved": resolved}
+        return {"path": str(folder), "files": files, "revision_resolved": resolved}
+
+    # ------------------------------------------------------------------ FP16 reference
+
+    FP16_FILES = ("pi05.gguf", "tokenizer.model", "norm_stats.json", "eaq-export.json")
+
+    def _fp16_valid(self, folder):
+        """The export manifest of `folder` if its pi05.gguf matches it (and FP16_SHA256, if pinned)."""
+        try:
+            manifest = json.loads((folder / "eaq-export.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not all((folder / name).is_file() for name in self.FP16_FILES):
+            return None
+        if FP16_SHA256 and manifest.get("sha256") != FP16_SHA256:
+            return None
+        return manifest if self._sha256(folder / "pi05.gguf") == manifest.get("sha256") else None
+
+    def _fp16_checkpoint(self):
+        """The FP16 reference: already in the work folder, copied from --model-cache, or exported."""
+        cache = None
+        if self.args.model_cache:
+            cache = Path(self.args.model_cache) / f"{MODELS['fp16']}-{BASE_REVISION[:7]}-{ACTQUANT_COMMIT[:7]}"
+        self.deviation("model_fp16", f"Reference model: FP16 export of {BASE_REPO}@{BASE_REVISION[:7]} by "
+                                     "ActQuant's tools/pi0.5/export_pi05.py (the file its 3-bit release is merged "
+                                     "into), run with a lazy state-dict loader and a temp-file GGUF writer. "
+                                     "norm_stats.json is the 3-bit release's, so only the weights differ.")
+        log("checking for an FP16 export in the work folder")
+        manifest = self._fp16_valid(self.checkpoint)
+        if manifest:
+            return {"source": "work folder", "path": str(self.checkpoint), "manifest": manifest}
+        if cache and (cache / "eaq-export.json").is_file():
+            log(f"copying the FP16 export from {cache}")
+            started = time.monotonic()
+            self.checkpoint.mkdir(parents=True, exist_ok=True)
+            for name in self.FP16_FILES:
+                shutil.copyfile(cache / name, self.checkpoint / name)
+            manifest = self._fp16_valid(self.checkpoint)
+            if manifest:
+                return {"source": "cache", "cache": str(cache), "path": str(self.checkpoint),
+                        "copy_seconds": round(time.monotonic() - started, 1), "manifest": manifest}
+            log("the cached copy does not match its manifest; exporting again")
+        details = self._fp16_export()
+        if cache:
+            log(f"storing the FP16 export in {cache}")
+            partial = cache.with_name(cache.name + ".partial")
+            shutil.rmtree(partial, ignore_errors=True)
+            partial.mkdir(parents=True)
+            for name in self.FP16_FILES:
+                shutil.copyfile(self.checkpoint / name, partial / name)
+            shutil.rmtree(cache, ignore_errors=True)
+            partial.rename(cache)
+            details["cached_to"] = str(cache)
+        return details
+
+    def _fp16_export(self):
+        started = time.monotonic()
+        # The 3-bit release's tokenizer (the same 4,264,023-byte file as the gated
+        # google/paligemma-3b-pt-224 tokenizer.model) and its quantile norm_stats.json.
+        release = self.work / "checkpoints" / MODELS["actquant-3bpw"]
+        small = {name: CHECKPOINT_FILES[name] for name in ("tokenizer.model", "norm_stats.json")}
+        release_files = self._download_release(release, small)["files"]
+        base = self._download_base()
+        shutil.copyfile(release / "tokenizer.model", base["dir"] / "tokenizer.model")
+        source = self.stage_source()
+        python = self._export_venv()
+
+        output = self.work / "fp16-export"
+        shutil.rmtree(output, ignore_errors=True)
+        output.mkdir(parents=True)
+        scratch = self.work / "fp16-export-tmp"  # GGUFWriter's temp file: about 7 GB
+        scratch.mkdir(exist_ok=True)
+        wrapper = self.work / "eaq_export_pi05.py"
+        wrapper.write_text(EXPORT_WRAPPER, encoding="utf-8")
+        env = {key: value for key, value in os.environ.items()
+               if key not in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE", "VIRTUAL_ENV")}
+        env.update(TMPDIR=str(scratch), PI05_OUTPUT_PRECISION="fp16", PYTHONUNBUFFERED="1")
+        log("exporting the FP16 model with export_pi05.py (CPU; several minutes)")
+        result = _stream([python, wrapper, self.source, base["dir"], output], self.output / "export_fp16.log",
+                         timeout=3600, env=env, echo=False)
+        shutil.rmtree(scratch, ignore_errors=True)
+        if result["returncode"] != 0 or not (output / "pi05.gguf").is_file():
+            raise StageError("export_pi05.py failed.", {"tail": result["tail"][-3000:]})
+
+        # export_pi05.py derives norm_stats.json from lerobot's MEAN_STD normalizer files; the 3-bit
+        # release ships quantile stats, which serve_policy.py prefers. Keep the release's, so the
+        # two models differ only in their weights.
+        exported_stats = json.loads((output / "norm_stats.json").read_text(encoding="utf-8"))
+        shutil.move(output / "norm_stats.json", output / "norm_stats.export.json")
+        shutil.copyfile(release / "norm_stats.json", output / "norm_stats.json")
+        structure = self._compare_with_release(output / "pi05.gguf")
+        digest = self._sha256(output / "pi05.gguf")
+        if FP16_SHA256 and digest != FP16_SHA256:
+            raise StageError(f"FP16 export SHA-256 {digest} differs from the pinned {FP16_SHA256}.",
+                             {"structure": structure})
+        manifest = {"sha256": digest, "bytes": (output / "pi05.gguf").stat().st_size,
+                    "base": {"repo": BASE_REPO, "revision": BASE_REVISION},
+                    "actquant_commit": ACTQUANT_COMMIT, "export": "tools/pi0.5/export_pi05.py",
+                    "precision": "fp16", "tokenizer_sha256": release_files["tokenizer.model"]["sha256"],
+                    "norm_stats": f"{CHECKPOINT_REPO}@{CHECKPOINT_REVISION[:7]}",
+                    "exported_norm_stats_keys": sorted(exported_stats)}
+        (output / "eaq-export.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        shutil.rmtree(self.checkpoint, ignore_errors=True)
+        self.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        output.rename(self.checkpoint)
+        return {"source": "export", "path": str(self.checkpoint), "manifest": manifest, "structure": structure,
+                "base": base["files"], "actquant_source": source.get("commit"),
+                "export_seconds": result["seconds"], "seconds": round(time.monotonic() - started, 1)}
+
+    def _download_base(self):
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as exc:
+            raise StageError("huggingface_hub is not installed.") from exc
+        folder = self.work / "base" / BASE_REPO.split("/")[-1]
+        folder.mkdir(parents=True, exist_ok=True)
+        files = {}
+        for name, expected in BASE_FILES.items():
+            target = folder / name
+            if not (target.is_file() and (expected is None or self._sha256(target) == expected)):
+                log(f"downloading {BASE_REPO}/{name}")
+                started = time.monotonic()
+                try:
+                    target = Path(hf_hub_download(BASE_REPO, name, revision=BASE_REVISION, local_dir=str(folder)))
+                except Exception as exc:  # never log tokens or raw HTTP exceptions
+                    code = getattr(getattr(exc, "response", None), "status_code", None)
+                    raise StageError(f"Download of {BASE_REPO}/{name} failed ({type(exc).__name__}, HTTP {code}).")
+                files[name] = {"download_seconds": round(time.monotonic() - started, 1)}
+            digest = self._sha256(target)
+            files.setdefault(name, {}).update(bytes=target.stat().st_size, sha256=digest)
+            if expected is not None and digest != expected:
+                raise StageError(f"{name} SHA-256 mismatch: expected {expected}, got {digest}.", {"files": files})
+        return {"dir": folder, "files": files}
+
+    def _export_venv(self):
+        """A CPU venv with requirements/fp16-export.txt (torch CPU, safetensors, numpy, pyyaml)."""
+        requirements = Path(self.args.export_requirements)
+        if not requirements.is_file():
+            raise StageError(f"{requirements} not found.")
+        venv = self.work / "export-venv"
+        python = venv / "bin" / "python"
+        marker = venv / ".eaq-requirements"
+        digest = self._sha256(requirements)
+        if python.exists() and marker.is_file() and marker.read_text(encoding="utf-8").strip() == digest:
+            return python
+        shutil.rmtree(venv, ignore_errors=True)
+        uv = _which("uv")
+        index = ["--extra-index-url", "https://download.pytorch.org/whl/cpu"]
+        if uv:
+            steps = [[uv, "venv", "--python", sys.executable, venv],
+                     [uv, "pip", "install", "--python", python, "-r", requirements, *index,
+                      "--index-strategy", "unsafe-best-match"]]
+        else:
+            steps = [[sys.executable, "-m", "venv", venv], [python, "-m", "pip", "install", "-r", requirements, *index]]
+        log("installing the export environment (torch CPU, about 0.2 GB)")
+        for command in steps:
+            result = _run(command, timeout=1800)
+            if result["returncode"] != 0:
+                raise StageError("Installing the FP16 export environment failed.",
+                                 {"command": [str(part) for part in command], "output": result["output"][-2500:]})
+        marker.write_text(digest + "\n", encoding="utf-8")
+        return python
+
+    def _compare_with_release(self, path):
+        """Tensor names, shapes and types of the export against the 3-bit release's header."""
+        with open(path, "rb") as handle:
+            ours = gguf_tensor_table(handle.read(8 * 2**20))
+        url = f"https://huggingface.co/{CHECKPOINT_REPO}/resolve/{CHECKPOINT_REVISION}/pi05.gguf"
+        try:  # the header only: the first megabytes, not the 2.4 GB file
+            request = urllib.request.Request(url, headers={"Range": f"bytes=0-{8 * 2**20 - 1}"})
+            with urllib.request.urlopen(request, timeout=120) as response:
+                theirs = gguf_tensor_table(response.read())
+        except Exception as exc:
+            return {"compared": False, "reason": f"{type(exc).__name__}", "tensors": len(ours)}
+        types = collections.defaultdict(collections.Counter)
+        for name, (_, kind) in ours.items():
+            types[name.split(".")[0]][kind] += 1
+        missing, extra = sorted(set(theirs) - set(ours)), sorted(set(ours) - set(theirs))
+        # The release pads some K-quant tensors to 256 columns; FP16 tensors are not padded.
+        reshaped = {name: {"fp16": ours[name][0], "release": theirs[name][0]}
+                    for name in sorted(set(ours) & set(theirs)) if ours[name][0] != theirs[name][0]}
+        details = {"compared": True, "tensors": len(ours), "release_tensors": len(theirs),
+                   "missing": missing[:20], "extra": extra[:20], "shape_differences": len(reshaped),
+                   "shape_examples": dict(list(reshaped.items())[:5]),
+                   "types": {group: dict(counts) for group, counts in types.items()}}
+        # The release also carries quantile norm.*_q01/q99 tensors (its export read openpi's assets;
+        # lerobot's checkpoint gives export_pi05.py mean/std only). The runtime does not read norm.*
+        # tensors: serve_policy.py takes the stats from norm_stats.json, which is the release's here.
+        if [name for name in missing if not name.startswith("norm.")] or extra:
+            raise StageError("The FP16 export's tensors differ from the 3-bit release's.", details)
+        return details
 
     @staticmethod
     def _sha256(path):
@@ -1195,6 +1513,12 @@ def main():
     parser.add_argument("--no-binding", action="store_true", help="Do not build the pi05.so Python binding.")
     parser.add_argument("--cpu-check", action="store_true", help="Also run the CLI on CPU and compare.")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    parser.add_argument("--model", choices=list(MODELS), default="actquant-3bpw",
+                        help="the released 3-bit checkpoint, or the FP16 reference exported from its base")
+    parser.add_argument("--model-cache", type=Path,
+                        help="folder to reuse an FP16 export from, and to store a new one in (e.g. Google Drive)")
+    parser.add_argument("--export-requirements", type=Path,
+                        default=Path(__file__).resolve().parents[1] / "requirements" / "fp16-export.txt")
     parser.add_argument("--build-timeout", type=int, default=TIMEOUTS["build"])
     args = parser.parse_args()
     if args.no_gpu and not args.cuda_arch:

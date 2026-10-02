@@ -59,7 +59,10 @@ SERVE_POLICY_URL = (f"https://raw.githubusercontent.com/arashakb/ActQuant/{ACTQU
                     "tools/pi0.5/serve_policy.py")
 SERVE_POLICY_SHA256 = "a82c2671209e28df052c5926558b3d642a9ad102b6e2afc34bb2fed98bdb7ab4"
 # Where actquant_build.py's download stage puts the checkpoint.
-CHECKPOINT_SUBDIR = Path("checkpoints") / "actquant-pi05-libero-3bpw"
+# Model name: checkpoint folder in the work folder (as in actquant_build.py's MODELS). "fp16" is the
+# reference exported from the 3-bit release's base checkpoint by ActQuant's export_pi05.py.
+CHECKPOINTS = {"actquant-3bpw": Path("checkpoints") / "actquant-pi05-libero-3bpw",
+               "fp16": Path("checkpoints") / "pi05-libero-fp16"}
 CLIENT_PYTHON = "3.8"
 FLOW_STEPS = 10  # run_libero_eval.sh: FLOW_STEPS=10
 STAGES = ("runtime", "client", "server", "profile", "rollout", "hold")
@@ -643,7 +646,7 @@ class Rollout:
         self.work = Path(args.work_dir).resolve()
         self.output = Path(args.output).resolve()
         self.libero_root = self.work / "libero"
-        self.checkpoint = self.work / CHECKPOINT_SUBDIR
+        self.checkpoint = self.work / CHECKPOINTS[args.model]
         self.deviations = {}
         self.server_process = None
         self.report = {
@@ -653,7 +656,7 @@ class Rollout:
             "started_utc": _now(),
             "pins": {"actquant": ACTQUANT_COMMIT, "openpi": OPENPI_COMMIT, "libero": LIBERO_COMMIT,
                      "serve_policy_sha256": SERVE_POLICY_SHA256, "openpi_main_sha256": OPENPI_MAIN_SHA256},
-            "options": {"stages": args.stages, "suites": args.suites, "trials_per_task": args.trials,
+            "options": {"model": args.model, "stages": args.stages, "suites": args.suites, "trials_per_task": args.trials,
                         "replan_steps": args.replan_steps, "seed": args.seed, "device": args.device,
                         "gl": args.gl, "work_dir": str(self.work)},
             "host": self._host(),
@@ -823,8 +826,11 @@ class Rollout:
             command += ["--toolkit-requirements", self.args.toolkit_requirements]
         if self.args.prebuilt_pin:
             command += ["--prebuilt-pin", self.args.prebuilt_pin]
+        command += ["--model", self.args.model]
+        if self.args.model_cache:
+            command += ["--model-cache", self.args.model_cache]
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}  # the notebook's own interpreter: keep its settings
-        result = _stream(command, self.output / "runtime.log", 3600, env=env)
+        result = _stream(command, self.output / "runtime.log", 7200, env=env)
         report = _read_json(runtime_output / "report.json") or {}
         stages = {name: entry.get("status") for name, entry in report.get("stages", {}).items()}
         details = {"stages": stages, "returncode": result["returncode"]}
@@ -1320,6 +1326,9 @@ def main():
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--device", default="CUDA0", help="ggml device for the policy server")
+    parser.add_argument("--model", choices=list(CHECKPOINTS), default="actquant-3bpw",
+                        help="the released 3-bit checkpoint, or the FP16 reference exported from its base")
+    parser.add_argument("--model-cache", help="folder to reuse an FP16 export from and store one in")
     parser.add_argument("--gl", default="auto", choices=["auto", *(name for name, _ in GL_CANDIDATES)])
     parser.add_argument("--client-threads", type=int, default=1,
                         help="cap for the client's thread pools (OpenMP, BLAS, numba, Mesa llvmpipe)")

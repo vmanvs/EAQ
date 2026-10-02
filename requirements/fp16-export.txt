@@ -1,0 +1,7 @@
+# CPU-only environment for ActQuant's tools/pi0.5/export_pi05.py (the FP16 reference model),
+# installed by scripts/actquant_build.py's download stage with --model fp16. gguf comes from the
+# ActQuant checkout (gguf-py), not from PyPI. torch is the CPU build from download.pytorch.org.
+torch==2.8.0+cpu
+safetensors==0.5.3
+numpy==2.2.6
+pyyaml==6.0.2
