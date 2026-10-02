@@ -37,6 +37,7 @@ UPLOADS = ("scripts/libero_rollout.py", "scripts/actquant_build.py", f"requireme
            "requirements/libero-server.txt")
 REMOTE = "/content/eaq"
 SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
+STAGES = ("runtime", "client", "server", "profile", "rollout")
 
 # Runs on the VM: start libero_rollout.py in its own session, detached from the kernel.
 LAUNCH = r'''
@@ -116,6 +117,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--suites", default="libero_spatial", help="comma-separated, or 'all' (run in sequence)")
     parser.add_argument("--trials", type=int, default=1, help="trials per task (ActQuant uses 50)")
+    parser.add_argument("--stages", default="runtime,client,server,rollout",
+                        help="libero_rollout.py stages, comma-separated; add 'profile' to time inference first")
+    parser.add_argument("--profile-requests", type=int, default=20, help="requests per phase of the profile stage")
     parser.add_argument("--session", default="eaq-libero")
     parser.add_argument("--attach", metavar="RUN", help="watch a run already started in --session")
     parser.add_argument("--keep", action="store_true", help="leave the session running at the end")
@@ -130,6 +134,9 @@ def main():
     suites = list(SUITES) if args.suites == "all" else [name.strip() for name in args.suites.split(",") if name.strip()]
     if unknown := [name for name in suites if name not in SUITES]:
         raise SystemExit(f"Unknown suites {unknown}; choose from {', '.join(SUITES)} or 'all'.")
+    stages = [name.strip() for name in args.stages.split(",") if name.strip()]
+    if unknown := [name for name in stages if name not in STAGES]:
+        raise SystemExit(f"Unknown stages {unknown}; choose from {', '.join(STAGES)}.")
     if not (REPO / "requirements" / PIN).is_file():
         raise SystemExit(f"requirements/{PIN} is missing: build the runtime with cuda_arch=75 and add its pin.")
     local_runs = Path(args.local_runs)
@@ -150,7 +157,8 @@ def main():
                                                   f"os.makedirs('{REMOTE}/' + d, exist_ok=True)\n")
         for path in UPLOADS:
             colab("upload", "-s", args.session, str(REPO / path), f"{REMOTE}/{path}")
-        rollout_args = ["--suites", *suites, "--trials", str(args.trials), "--suite-hours", str(args.suite_hours),
+        rollout_args = ["--stages", *stages, "--profile-requests", str(args.profile_requests),
+                        "--suites", *suites, "--trials", str(args.trials), "--suite-hours", str(args.suite_hours),
                         "--client-threads", str(args.client_threads), "--server-threads", str(args.server_threads),
                         "--prebuilt-pin", f"{REMOTE}/requirements/{PIN}",
                         "--toolkit-requirements", f"{REMOTE}/requirements/actquant-cuda-toolkit.txt",
@@ -190,6 +198,13 @@ def main():
 
     report = json.loads((local_runs / run / "report.json").read_text(encoding="utf-8"))
     print(f"[local] status: {report.get('status')}")
+    client = report.get("stages", {}).get("client", {})
+    if client.get("render"):
+        print(f"[local] rendering: {client.get('gl')}, {client['render'].get('renderer')}, "
+              f"{client['render'].get('step_ms')} ms per step")
+    for phase, entry in report.get("stages", {}).get("profile", {}).get("phases", {}).items():
+        total = entry["pi05_ms"].get("chain/Total", {}).get("p50")
+        print(f"[local] profile {phase}: pi05 total p50 {total} ms, round trip p50 {entry['round_trip_ms']['p50']} ms")
     for suite, result in report.get("stages", {}).get("rollout", {}).get("results", {}).items():
         print(f"[local] {suite}: {result.get('successes')}/{result.get('episodes')} "
               f"(ActQuant reports {result.get('actquant_reported')}), valid={result.get('valid')}")

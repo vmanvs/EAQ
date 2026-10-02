@@ -33,10 +33,11 @@ comparison and starting point for this study. World-action models such as
 As of 2026-09-29, ActQuant's released 3-bit Pi 0.5 checkpoint runs closed-loop
 on LIBERO through ActQuant's policy server and openpi's LIBERO client, both
 unmodified, on a free Google Colab T4. A 10-episode `libero_spatial` smoke run
-succeeded in 10 of 10 episodes. That shows the pipeline works; it is not yet a
-baseline measurement. The next milestone is reproducing ActQuant's reported
-success rates over full suites (50 trials per task), which first needs faster
-simulation: an episode currently takes about 88 s, mostly CPU rendering.
+succeeded in 10 of 10 episodes, twice. That shows the pipeline works; it is not yet a
+baseline measurement. With MuJoCo rendering on the GPU, an episode takes
+about 18 s, so a full suite (500 episodes) fits in one Colab session. The next
+milestone is reproducing ActQuant's reported success rates over full suites
+(50 trials per task).
 
 ## Cloud validation
 

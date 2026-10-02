@@ -62,19 +62,25 @@ SERVE_POLICY_SHA256 = "a82c2671209e28df052c5926558b3d642a9ad102b6e2afc34bb2fed98
 CHECKPOINT_SUBDIR = Path("checkpoints") / "actquant-pi05-libero-3bpw"
 CLIENT_PYTHON = "3.8"
 FLOW_STEPS = 10  # run_libero_eval.sh: FLOW_STEPS=10
-STAGES = ("runtime", "client", "server", "rollout", "hold")
-DEFAULT_STAGES = ("runtime", "client", "server", "rollout")  # "hold" is a diagnostic, run on its own
+STAGES = ("runtime", "client", "server", "profile", "rollout", "hold")
+DEFAULT_STAGES = ("runtime", "client", "server", "rollout")  # "profile" and "hold" are diagnostics
 SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 TASKS_PER_SUITE = 10
 # Success rates on the checkpoint's model card (500 trials per suite, pi05.so binding).
 REPORTED_SUCCESS = {"libero_spatial": 0.982, "libero_object": 0.988, "libero_goal": 0.950, "libero_10": 0.872}
 PROBE_PROMPT = "put the black bowl on the plate"
-# Rendering backends tried in order: MUJOCO_GL value and extra environment.
+# Rendering backends tried in order: MUJOCO_GL value and extra environment. "egl-nvidia" registers
+# the driver's own EGL library with glvnd (its extra environment is built in _nvidia_egl_env): Colab
+# ships libEGL_nvidia.so.0 in /usr/lib64-nvidia but only Mesa's vendor file, so plain "egl" renders
+# with llvmpipe on the CPU (96 ms per 256x256 frame on Colab's T4 VM, against 0.8 ms on the GPU).
 GL_CANDIDATES = (
+    ("egl-nvidia", None),
     ("egl", {}),
     ("egl-mesa", {"__EGL_VENDOR_LIBRARY_FILENAMES": "/usr/share/glvnd/egl_vendor.d/50_mesa.json"}),
     ("osmesa", {}),
 )
+# Where NVIDIA's EGL library may be when no vendor file registers it (Colab: /usr/lib64-nvidia).
+NVIDIA_EGL_DIRS = ("/usr/lib64-nvidia", "/usr/local/nvidia/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/lib64")
 GL_APT_PACKAGES = ("libegl1", "libegl-mesa0", "libgl1", "libgl1-mesa-dri", "libosmesa6")
 NICENESS = 10
 # serve_policy.py log lines that make a rollout invalid.
@@ -122,7 +128,8 @@ print("EAQ_PROBE " + json.dumps({
     "setup_seconds": round(ready - started, 1), "step_ms": round((stepped - ready) * 50, 1)}))
 '''
 
-SERVER_PROBE = r'''
+# openpi's WebSocket protocol, shared by the probe clients below.
+WIRE = r'''
 import json, sys, time
 import msgpack
 import numpy as np
@@ -140,6 +147,9 @@ def unpack(obj):
         return np.ndarray(buffer=obj[b"data"], dtype=np.dtype(obj[b"dtype"]), shape=tuple(obj[b"shape"]))
     return obj
 
+'''
+
+SERVER_PROBE = WIRE + r'''
 uri, prompt, image_path = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
     import cv2
@@ -179,6 +189,59 @@ print("EAQ_PROBE " + json.dumps({"hold_requests": hold_requests,
     "first_action": [round(float(v), 4) for v in actions[0]],
     "repeat_max_abs_diff": float(np.abs(np.asarray(outputs[0]["actions"]) - actions).max()),
     "round_trip_ms": round_trips, "server_timing": outputs[-1].get("server_timing")}))
+'''
+
+# The profile stage's client: phases of requests to the policy server, each printed with its wall-clock
+# span, so the stage can match pi05's per-inference timing summaries and GPU samples to a phase.
+PROFILE_PROBE = WIRE + r'''
+import subprocess
+uri, prompt, image_path, requests = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+try:
+    import cv2
+    base = cv2.resize(cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB), (224, 224))
+except Exception:
+    base = np.full((224, 224, 3), 128, dtype=np.uint8)
+rng = np.random.default_rng(0)
+
+def observation(distinct):
+    image = base
+    if distinct:  # a different image each time, as in a rollout; the content stays a LIBERO scene
+        image = np.clip(base.astype(np.int16) + rng.integers(-8, 9, base.shape), 0, 255).astype(np.uint8)
+    return {"observation/image": image, "observation/wrist_image": image[::-1].copy(),
+            "observation/state": rng.normal(0, 0.1, 8), "prompt": prompt}
+
+# same: one observation repeated (the server stage's probe does this); distinct: a new image per
+# request; distinct_cpu_load: the same with a busy process on the CPU, as the simulator is in a rollout.
+phases = [("warmup", False, 2, False), ("same", False, requests, False), ("distinct", True, requests, False),
+          ("distinct_cpu_load", True, requests, True)]
+results = []
+with connect(uri, compression=None, max_size=None, open_timeout=60) as websocket:
+    websocket.recv()  # metadata
+    for name, distinct, count, load in phases:
+        burner = subprocess.Popen([sys.executable, "-c", "while True: pass"]) if load else None
+        try:
+            started, round_trips = time.time(), []
+            obs = observation(distinct)
+            for _ in range(count):
+                if distinct:
+                    obs = observation(True)
+                begin = time.monotonic()
+                websocket.send(msgpack.packb(pack(obs)))
+                reply = websocket.recv()
+                round_trips.append(round((time.monotonic() - begin) * 1000, 1))
+                if isinstance(reply, str):
+                    print("EAQ_PROFILE " + json.dumps({"server_error": reply[-3000:]}))
+                    sys.exit(1)
+                actions = np.asarray(msgpack.unpackb(reply, object_hook=unpack)["actions"])
+                if not np.isfinite(actions).all():
+                    print("EAQ_PROFILE " + json.dumps({"server_error": "non-finite actions"}))
+                    sys.exit(1)
+            results.append({"phase": name, "requests": count, "start": started, "end": time.time(),
+                            "round_trip_ms": round_trips})
+        finally:
+            if burner:
+                burner.kill()
+print("EAQ_PROFILE " + json.dumps({"phases": results}))
 '''
 
 
@@ -382,6 +445,18 @@ def _free_port(preferred):
     raise StageError("No free TCP port for the policy server.")
 
 
+def _nvidia_egl_library():
+    """Path of NVIDIA's EGL vendor library (libEGL_nvidia.so.0), or None."""
+    dirs = [part for part in os.environ.get("LD_LIBRARY_PATH", "").split(":") if part] + list(NVIDIA_EGL_DIRS)
+    for folder in dirs:
+        path = Path(folder) / "libEGL_nvidia.so.0"
+        if path.exists():
+            return path
+    ldconfig = shutil.which("ldconfig") or "/sbin/ldconfig"
+    match = re.search(r"libEGL_nvidia\.so\.0 .*=> (\S+)", _run([ldconfig, "-p"])["output"])
+    return Path(match[1]) if match else None
+
+
 def _wilson(successes, trials, z=1.96):
     """95% Wilson score interval for a success rate."""
     if trials == 0:
@@ -448,6 +523,76 @@ class ServerLog:
     @property
     def problem_count(self):
         return sum(self.counts.values())
+
+
+TIMING_SECTIONS = {"Level 1: Chain": "chain", "Level 2: compute_kv_cache": "kv_cache",
+                   "Level 2: ODE per step": "ode_step"}
+TIMING_LINE = re.compile(r"^\s+(\S.*?)\s*:\s*([\d.]+) ms")
+
+
+def _timing_summaries(path, offset=0):
+    """pi05's "Inference Timing Summary" blocks in a server log after byte `offset`, one
+    {"section/name": ms} per inference."""
+    summaries, current, section = [], None, None
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            lines = handle.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return summaries
+    for line in lines:
+        if "=== Inference Timing Summary ===" in line:
+            current, section = {}, None
+        elif current is None:
+            continue
+        elif line.startswith("====="):
+            summaries.append(current)
+            current = None
+        elif line.startswith("["):
+            section = next((key for prefix, key in TIMING_SECTIONS.items() if line[1:].startswith(prefix)), None)
+        elif section and (match := TIMING_LINE.match(line)):
+            current[f"{section}/{match[1]}"] = float(match[2])
+    return summaries
+
+
+class GpuSampler:
+    """nvidia-smi samples (clocks, power, utilisation, throttle reasons) twice a second, with timestamps."""
+
+    FIELDS = ("clocks.sm", "clocks.mem", "power.draw", "utilization.gpu", "temperature.gpu", "pstate",
+              "clocks_event_reasons.active")
+
+    def __init__(self):
+        self.samples = []
+        smi = _which("nvidia-smi")
+        self.process = None if not smi else subprocess.Popen(
+            [smi, f"--query-gpu={','.join(self.FIELDS)}", "--format=csv,noheader,nounits", "-lms", "500"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        if self.process:
+            self.thread.start()
+
+    def _read(self):
+        for line in self.process.stdout:
+            values = [part.strip() for part in line.split(",")]
+            if len(values) == len(self.FIELDS):
+                self.samples.append((time.time(), dict(zip(self.FIELDS, values))))
+
+    def stop(self):
+        if self.process:
+            self.process.terminate()
+            self.process.wait(timeout=10)
+
+    def between(self, start, end):
+        rows = [values for stamp, values in self.samples if start <= stamp <= end]
+        summary = {"samples": len(rows)}
+        for field in ("clocks.sm", "clocks.mem", "power.draw", "utilization.gpu", "temperature.gpu"):
+            numbers = [float(row[field]) for row in rows if re.fullmatch(r"[\d.]+", row[field])]
+            if numbers:
+                summary[field] = {"mean": round(sum(numbers) / len(numbers), 1), "min": min(numbers),
+                                  "max": max(numbers)}
+        summary["pstates"] = sorted({row["pstate"] for row in rows})
+        summary["throttle_reasons"] = sorted({row["clocks_event_reasons.active"] for row in rows})
+        return summary
 
 
 class EpisodeParser:
@@ -706,8 +851,23 @@ class Rollout:
             if name == gl_name:
                 env["MUJOCO_GL"] = name.split("-")[0]
                 env["PYOPENGL_PLATFORM"] = name.split("-")[0]
-                env.update(extra)
+                env.update(self._nvidia_egl_env(env) if extra is None else extra)
         return env
+
+    def _nvidia_egl_env(self, env):
+        """glvnd settings that make EGL load NVIDIA's library, or {} if the driver has none."""
+        library = _nvidia_egl_library()
+        if library is None:
+            return {}
+        vendor = self.libero_root / "egl_vendor.d" / "10_nvidia.json"
+        vendor.parent.mkdir(parents=True, exist_ok=True)
+        vendor.write_text(json.dumps({"file_format_version": "1.0.0",
+                                      "ICD": {"library_path": str(library)}}) + "\n", encoding="utf-8")
+        # The library's own dependencies (libnvidia-eglcore, ...) sit next to it, outside the
+        # loader's search path on Colab; without them EGL finds no device.
+        search = [str(library.parent)] + [part for part in env.get("LD_LIBRARY_PATH", "").split(":")
+                                           if part and part != str(library.parent)]
+        return {"__EGL_VENDOR_LIBRARY_FILENAMES": str(vendor), "LD_LIBRARY_PATH": ":".join(search)}
 
     def _fetch_libero(self):
         source = self.libero_root / "LIBERO"
@@ -784,6 +944,8 @@ class Rollout:
             for name in candidates:
                 if name == "egl-mesa" and not Path(dict(GL_CANDIDATES)[name]["__EGL_VENDOR_LIBRARY_FILENAMES"]).is_file():
                     continue
+                if name == "egl-nvidia" and (round_ == "apt" or _nvidia_egl_library() is None):
+                    continue
                 log(f"render probe with MUJOCO_GL={name}")
                 ok, attempt = self._render_probe(python, name)
                 attempts.append(attempt)
@@ -794,7 +956,7 @@ class Rollout:
                 break
         if not chosen:
             raise StageError("No MuJoCo rendering backend could render a LIBERO scene.", {"attempts": attempts})
-        if chosen["gl"] != "egl":
+        if chosen["gl"] not in ("egl", "egl-nvidia"):  # egl-nvidia is EGL on the GPU, only registered by us
             self.deviation("gl", f"MuJoCo rendering with {chosen['gl']} (ActQuant's README uses EGL).")
         shutil.copy2(self.output / chosen["image"], self.libero_root / "render_probe.png")
         (self.libero_root / "client.json").write_text(json.dumps(
@@ -917,6 +1079,69 @@ class Rollout:
                                      "for) with requirements/libero-server.txt; ActQuant uses openpi's Python 3.11 "
                                      "venv.")
         return details
+
+    def stage_profile(self):
+        """Diagnostic: where a policy inference spends its time, without the simulator.
+
+        Sends --profile-requests observations per phase (one repeated, distinct ones, distinct ones
+        with a busy process on the CPU) and matches pi05's own per-inference timing summaries and
+        nvidia-smi samples to each phase.
+        """
+        if not (self.libero_root / "server-venv" / ".eaq-requirements").is_file():
+            raise StageError("The policy server is not set up; run the server stage.")
+        bin_dir, manifest = self._package()
+        port = _free_port(self.args.port)
+        log_path = self.output / "profile_server.log"
+        offset = log_path.stat().st_size if log_path.exists() else 0  # the log is appended to
+        self._start_server(port, log_name=log_path.name)
+        gpu = GpuSampler()
+        probe_script = self.libero_root / "profile_probe.py"
+        probe_script.write_text(PROFILE_PROBE, encoding="utf-8")
+        image = self.libero_root / "render_probe.png"
+        try:
+            result = _run([self.libero_root / "server-venv" / "bin" / "python", probe_script,
+                           f"ws://127.0.0.1:{port}", PROBE_PROMPT, image, self.args.profile_requests],
+                          timeout=3600, env=_child_env(PYTHONPATH=str(bin_dir)))
+        finally:
+            gpu.stop()
+            self._stop_server()
+        line = next((line for line in result["output"].splitlines() if line.startswith("EAQ_PROFILE ")), None)
+        probe = json.loads(line[len("EAQ_PROFILE "):]) if line else None
+        if result["returncode"] != 0 or not probe or "server_error" in probe:
+            raise StageError("The profile client failed.", {"output": result["output"][-2500:],
+                                                            "server_log_tail": self._tail(log_path)})
+        summaries = _timing_summaries(log_path, offset)
+        expected = sum(phase["requests"] for phase in probe["phases"])
+        if len(summaries) != expected:
+            raise StageError(f"The server log has {len(summaries)} timing summaries for {expected} requests.",
+                             {"server_log_tail": self._tail(log_path)})
+        with open(log_path, "rb") as handle:
+            handle.seek(offset)
+            log_text = handle.read().decode("utf-8", errors="replace")
+        phases, index = {}, 0
+        for phase in probe["phases"]:
+            block = summaries[index:index + phase["requests"]]
+            index += phase["requests"]
+            timing = {}
+            for key in block[0]:
+                values = [entry[key] for entry in block if key in entry]
+                timing[key] = {"mean": round(sum(values) / len(values), 2), "p50": _percentile(values, 0.5),
+                               "min": min(values), "max": max(values)}
+            trips = phase["round_trip_ms"]
+            phases[phase["phase"]] = {
+                "requests": phase["requests"], "pi05_ms": timing,
+                "round_trip_ms": {"mean": round(sum(trips) / len(trips), 1), "p50": _percentile(trips, 0.5),
+                                  "max": max(trips)},
+                "gpu": gpu.between(phase["start"], phase["end"])}
+            chain = {key.split("/", 1)[1]: value["p50"] for key, value in timing.items() if key.startswith("chain/")}
+            log(f"profile {phase['phase']}: round trip p50 {phases[phase['phase']]['round_trip_ms']['p50']} ms; "
+                + ", ".join(f"{name} {ms:.0f}" for name, ms in chain.items()))
+        smi = _run(["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,clocks.max.mem,power.limit",
+                    "--format=csv,noheader"])["output"].strip()
+        return {"requests_per_phase": self.args.profile_requests, "phases": phases, "gpu": smi,
+                "ggml": [line for line in log_text.splitlines() if line.startswith("ggml_cuda_init")
+                         or "compute capability" in line],
+                "package": manifest.get("name"), "server_log": Path(log_path).name}
 
     def stage_hold(self):
         """Diagnostic: keep the sandbox in one controlled state for --hold-minutes, logging uptime.
@@ -1103,6 +1328,7 @@ def main():
     parser.add_argument("--hold-mode", choices=["idle", "server"], default="idle",
                         help="the hold stage: sleep only, or keep the GPU policy server answering requests")
     parser.add_argument("--hold-minutes", type=float, default=15.0)
+    parser.add_argument("--profile-requests", type=int, default=20, help="requests per phase of the profile stage")
     parser.add_argument("--suite-hours", type=float, default=10.0, help="time limit per suite")
     parser.add_argument("--actquant-script", default=str(repository / "scripts" / "actquant_build.py"))
     parser.add_argument("--toolkit-requirements", default=str(repository / "requirements" / "actquant-cuda-toolkit.txt"))

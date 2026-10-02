@@ -231,9 +231,10 @@ SHA-256 digests in `scripts/libero_rollout.py`.
 | Stage | What it does |
 | --- | --- |
 | `runtime` | Runs `actquant_build.py --stages toolkit fetch download`: the CUDA runtime, the pinned package and the checkpoint, reusing the work folder |
-| `client` | Installs Python 3.8 with uv and `requirements/libero-client.txt` without dependency resolution. Fetches LIBERO at openpi's submodule commit (`f78abd6`) and writes its config file, which LIBERO otherwise asks for on stdin. Renders one `libero_spatial` scene with EGL, then Mesa EGL, then OSMesa, and records the renderer and time per step; if none works it installs Mesa with apt and tries again |
+| `client` | Installs Python 3.8 with uv and `requirements/libero-client.txt` without dependency resolution. Fetches LIBERO at openpi's submodule commit (`f78abd6`) and writes its config file, which LIBERO otherwise asks for on stdin. Renders one `libero_spatial` scene with NVIDIA's EGL library (registered by the stage when the driver ships it unregistered, as on Colab), then EGL, then Mesa EGL, then OSMesa, and records the renderer and time per step; if none works it installs Mesa with apt and tries again |
 | `server` | Creates a venv for the Python `pi05.so` was built for, with `requirements/libero-server.txt`. Starts `serve_policy.py` on `CUDA0` with 10 flow steps, as `run_libero_eval.sh` does, and sends three observations over the openpi protocol |
 | `rollout` | Starts the server and runs `main.py` once per suite with `--args.port`, 5 replan steps and seed 7. Records every episode |
+| `profile` | Diagnostic: starts the server alone and sends repeated, distinct, and distinct-under-CPU-load observations. Matches pi05's per-inference timing summaries and `nvidia-smi` samples to each phase (see the [Colab guide](colab.md#where-an-inference-spends-its-time)) |
 | `hold` | Diagnostic, run on its own: keeps the sandbox busy for a set time, idle (`--hold-mode idle`) or with the policy server answering requests (`server`), to test whether a session survives |
 
 **Validity.** `serve_policy.py` answers a failed inference with zero actions,

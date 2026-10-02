@@ -64,6 +64,8 @@ python3 cloud/colab_libero.py --suites libero_spatial --trials 1
 | --- | --- | --- |
 | `--suites` | `libero_spatial` | Comma-separated suite names, or `all`; run in sequence |
 | `--trials` | 1 | Trials per task; ActQuant uses 50 |
+| `--stages` | `runtime,client,server,rollout` | `libero_rollout.py` stages; add `profile` to time inference before the rollout |
+| `--profile-requests` | 20 | Requests per phase of the profile stage |
 | `--session` | `eaq-libero` | Colab session name |
 | `--attach RUN` | | Resume watching a run already started in the session |
 | `--keep` | off | Leave the session running at the end |
@@ -109,31 +111,57 @@ Observed on 2026-09-28 on the free tier. Colab can change any of this.
 | Host | A full VM (not a gVisor sandbox), Ubuntu 24.04, glibc 2.39, root with apt |
 | CPU, memory, disk | 2 vCPUs (one physical core), 12 GB RAM, about 66 GB free disk |
 | Python | 3.13, with uv |
-| Rendering | Only Mesa's EGL is registered. MuJoCo renders with llvmpipe on the CPU |
+| Rendering | NVIDIA's EGL library is in `/usr/lib64-nvidia`, but only Mesa's vendor file is registered, so plain EGL renders with llvmpipe on the CPU. The client stage's `egl-nvidia` backend registers NVIDIA's library and renders on the T4 |
 
-## First result
+## Results
 
-Smoke run `20260928-202117-t1` (`libero_spatial`, one trial per task):
+| | CPU rendering (2026-09-28) | GPU rendering (2026-10-02) |
+| --- | --- | --- |
+| Run | `20260928-202117-t1` | `20261002-172743-t1` |
+| Renderer | Mesa llvmpipe | NVIDIA EGL on the T4 (`egl-nvidia`) |
+| Render probe, per control step | 516 ms | 64 ms |
+| `libero_spatial`, 1 trial per task | 10/10, `rollout_ok` | 10/10, `rollout_ok` |
+| Time per episode | ~88 s | ~18 s (14.5–21.6 s) |
+| Policy inference, per call (median) | 621 ms | 578 ms |
+| Share of episode time in inference | ~17% | ~68% |
 
-- **Result:** 10/10 successes, status `rollout_ok`, 95% Wilson interval
-  [0.72, 1.00]. There were no server problems or client exceptions.
-- **Stage times:** runtime 74 s, client 78 s, server 18 s, rollout 887 s.
-- **Session:** the VM stayed up for the whole run, more than 35 minutes.
+Ten episodes show that the pipeline works; they cannot be compared with
+ActQuant's reported 98.2% over 500 episodes. Rendering on the GPU is not a
+deviation from ActQuant's setup, which renders with EGL. The NVIDIA renderer
+can produce slightly different pixels from Mesa.
 
-Ten episodes say the pipeline works; they cannot be compared with ActQuant's
-reported 98.2% over 500 episodes.
+At about 18 s per episode, a full `libero_spatial` suite (500 episodes) takes
+about 2.5 hours, well inside Colab's 12-hour session limit. `libero_10`'s
+tasks are longer, so expect it to take a few times as long.
 
-**Speed is the open problem.**
+### Where an inference spends its time
 
-- An episode takes about 88 s.
-- Policy inference is 622 ms per call on the T4, which is about 17% of the
-  rollout time.
-- Most of the rest is the simulator, above all rendering the camera images with
-  llvmpipe on the single core: the render probe measured 516 ms per step.
-- At this speed, one suite at 50 trials per task (500 episodes) takes about as
-  long as Colab's 12-hour session limit, and `libero_10`'s longer tasks take
-  more.
+pi05 prints a timing breakdown for every inference into the server log. The
+`profile` stage (`--stages runtime,client,server,profile`) sends the server
+three phases of requests, with no simulator running:
+- **same:** one observation repeated;
+- **distinct:** a new image every time;
+- **distinct_cpu_load:** a new image every time, with a busy process on the CPU.
 
-Rendering on the GPU through NVIDIA's EGL library, if the VM provides it, is
-being investigated first. A full suite can also be split across several
-sessions.
+It matches each timing summary and an `nvidia-smi` sample to its phase.
+
+| Part of one inference, distinct images (median) | ms |
+| --- | --- |
+| Vision encoder, two cameras | ~76 |
+| Prefix forward: 18 language-model layers over 777 tokens | ~314 |
+| Action expert: 10 flow steps of ~12 ms | ~123 |
+| **Total** (round trip 521 ms) | **~515** |
+
+- **Repeated observations are much faster.** A repeated observation returns in
+  about 200 ms because pi05 skips the prefix forward when its input has not
+  changed. Its printed summary then repeats the last prefix time, so latency
+  from repeated inputs, as in the server stage's probe, understates real
+  inference.
+- **CPU load barely matters.** A busy CPU core adds about 8 ms.
+- **The T4 hits its 70 W power limit.** Under load it draws its full 70 W, and
+  `nvidia-smi` reports the software power cap as the clock limit. The SM
+  clock runs at 1.1–1.3 GHz instead of its 1.59 GHz maximum.
+- **Inference is slower inside a rollout.** It was 578 ms per call, against
+  521 ms back to back. The GPU idles between requests while the simulator
+  steps, and the warm-up phase shows its clock ramping up from 585 MHz. This
+  explanation is inferred, not measured.
