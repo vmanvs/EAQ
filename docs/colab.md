@@ -125,8 +125,20 @@ Observed on 2026-09-28 on the free tier. Colab can change any of this.
 | Policy inference, per call (median) | 621 ms | 578 ms |
 | Share of episode time in inference | ~17% | ~68% |
 
-Ten episodes show that the pipeline works; they cannot be compared with
-ActQuant's reported 98.2% over 500 episodes. Rendering on the GPU is not a
+Ten episodes only show that the pipeline works. The full suite,
+`20261002-175720-t50` (50 trials per task, GPU rendering), gives a number that
+can be compared with ActQuant's:
+
+- **Result:** 489/500 = 97.8%, 95% Wilson interval [0.961, 0.988]. ActQuant
+  reports 98.2%, which is inside the interval. The run was valid, with no
+  server problems or client exceptions.
+- **Per task:** most failures were on "pick up the black bowl next to the
+  ramekin and place it on the plate", at 43/50. "On the stove" had 48/50, and
+  "on the cookie box" and "on the wooden cabinet" 49/50 each; the other six
+  tasks were 50/50.
+- **Time:** the rollout took 2.8 hours. Episodes averaged 18.8 s; failed ones
+  averaged 36.3 s, because they run to the step limit.
+ Rendering on the GPU is not a
 deviation from ActQuant's setup, which renders with EGL. The NVIDIA renderer
 can produce slightly different pixels from Mesa.
 
