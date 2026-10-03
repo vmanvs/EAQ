@@ -121,10 +121,10 @@ def main():
     parser.add_argument("--stages", default="runtime,client,server,rollout",
                         help="libero_rollout.py stages, comma-separated; add 'profile' to time inference first")
     parser.add_argument("--profile-requests", type=int, default=20, help="requests per phase of the profile stage")
-    parser.add_argument("--model", choices=["actquant-3bpw", "fp16"], default="actquant-3bpw",
-                        help="the released 3-bit checkpoint, or the FP16 reference (exported on the VM)")
+    parser.add_argument("--model", choices=["actquant-3bpw", "fp16", "q8"], default="actquant-3bpw",
+                        help="the released 3-bit checkpoint, or the FP16 or Q8_0 reference (exported on the VM)")
     parser.add_argument("--drive", action="store_true",
-                        help="mount Google Drive (colab drivemount) and keep the FP16 export in "
+                        help="mount Google Drive (colab drivemount) and keep reference exports in "
                              f"{DRIVE_CACHE}, so later sessions copy it instead of exporting again")
     parser.add_argument("--session", default="eaq-libero")
     parser.add_argument("--attach", metavar="RUN", help="watch a run already started in --session")
@@ -159,7 +159,7 @@ def main():
         run = args.attach
     else:
         run = (dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S") + f"-t{args.trials}"
-               + ("-fp16" if args.model == "fp16" else ""))
+               + ("" if args.model == "actquant-3bpw" else f"-{args.model}"))
         colab("exec", "-s", args.session, stdin=f"import os\nfor d in ('scripts', 'requirements', 'runs'): "
                                                   f"os.makedirs('{REMOTE}/' + d, exist_ok=True)\n")
         for path in UPLOADS:

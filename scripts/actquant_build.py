@@ -19,8 +19,8 @@ leaves evidence:
              $ORIGIN:$ORIGIN/../cuda/lib, and install that package locally
   fetch      download the pinned release package, verify its SHA-256 and
              install it (the Molab path; replaces source/configure/build/package)
-  download   fetch the pinned 3-bit checkpoint and verify its SHA-256; with --model fp16,
-             export the FP16 reference from the base checkpoint with ActQuant's
+  download   fetch the pinned 3-bit checkpoint and verify its SHA-256; with --model fp16
+             or q8, export that reference from the base checkpoint with ActQuant's
              export_pi05.py instead (or copy it from --model-cache)
   infer      one inference through the CLI (and the binding, if present),
              from the installed package or else the build tree
@@ -89,15 +89,107 @@ BASE_FILES = {
     "policy_postprocessor_step_0_unnormalizer_processor.safetensors":
         "a002c0df7f79c5b169c5a899ad151d4ea1bed246c7d82bd93ed1556558d517a9",
 }
-FP16_SHA256 = None  # pi05.gguf of the FP16 export, once known; later exports and cached copies must match
-MODELS = {"actquant-3bpw": "actquant-pi05-libero-3bpw", "fp16": "pi05-libero-fp16"}  # name: checkpoint folder
+MODELS = {"actquant-3bpw": "actquant-pi05-libero-3bpw", "fp16": "pi05-libero-fp16",
+          "q8": "pi05-libero-q8"}  # name: checkpoint folder
+# References exported from the base checkpoint by export_pi05.py: name -> its quantization flags.
+# q8 quantizes what the 3-bit release quantizes (PaliGemma LLM, SigLIP vision, text embedding), to
+# Q8_0 instead of 2-3 bits, and keeps the action expert, projector and norms in FP16 as the release does.
+EXPORTS = {"fp16": [], "q8": ["--quant_llm", "q8", "--quant_vision", "q8", "--quant_embedding", "q8"]}
+# SHA-256 of each export's pi05.gguf, once known; later exports and cached copies must match.
+EXPORT_SHA256 = {"fp16": None, "q8": None}
 
-# Runs export_pi05.py unmodified, with two memory changes that do not alter its output: the 7.5 GB
+# Applied to the ActQuant checkout by the source stage. The pi05 runtime's vision, projector and
+# action expert each open the whole pi05.gguf and allocated every tensor in it on the device, so
+# the device held three copies of the file (6.25 GB FP16: ~19 GB, more than a T4's 15 GB). The
+# patch allocates each model's own tensors only, and has the text embedding read embed.weight
+# instead of the whole file into host RAM, where it stayed for the life of the process.
+ACTQUANT_PATCH_ID = "loadfix"
+ACTQUANT_PATCH = r'''diff --git a/tools/pi0.5/model_defs.cpp b/tools/pi0.5/model_defs.cpp
+index f2b2420..394cb0c 100644
+--- a/tools/pi0.5/model_defs.cpp
++++ b/tools/pi0.5/model_defs.cpp
+@@ -9,8 +9,7 @@ bool BaseModel::load_tensors(ModelLoader &model_loader, ContextManager &ctx_mana
+     std::map<std::string, size_t> tensor_offset;
+     gguf_context_ptr &ctx_gguf = model_loader.ctx_gguf_;
+ 
+-    ctx_manager.ctx_data_ = std::move(model_loader.ctx_meta_);
+-    ggml_context *ctx = ctx_manager.ctx_data_.get();
++    ggml_context_ptr ctx_meta = std::move(model_loader.ctx_meta_);
+ 
+     for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf.get()); ++i) {
+         const char *name = gguf_get_tensor_name(ctx_gguf.get(), i);
+@@ -18,6 +17,23 @@ bool BaseModel::load_tensors(ModelLoader &model_loader, ContextManager &ctx_mana
+                               gguf_get_tensor_offset(ctx_gguf.get(), i);
+     }
+ 
++    // Allocate this model's tensors only. Vision, projector and action expert each open the
++    // whole pi05.gguf; allocating its metadata context put one copy of the file per model on
++    // the device. The second get_tensors_to_load points the model at the copied tensors.
++    std::vector<ggml_tensor *> wanted = get_tensors_to_load(ctx_meta.get());
++    ggml_init_params ctx_params = {
++        /*.mem_size   =*/ (wanted.size() + 1) * ggml_tensor_overhead(),
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++    ctx_manager.ctx_data_.reset(ggml_init(ctx_params));
++    ggml_context *ctx = ctx_manager.ctx_data_.get();
++    for (ggml_tensor *t : wanted) {
++        if (!ggml_get_tensor(ctx, t->name)) {
++            ggml_set_name(ggml_dup_tensor(ctx, t), t->name);
++        }
++    }
++
+     std::vector<ggml_tensor *> tensors_to_load = get_tensors_to_load(ctx);
+ 
+     std::vector<uint8_t> read_buf;
+diff --git a/tools/pi0.5/text_embed.hpp b/tools/pi0.5/text_embed.hpp
+index 9a38162..451b8d8 100644
+--- a/tools/pi0.5/text_embed.hpp
++++ b/tools/pi0.5/text_embed.hpp
+@@ -14,6 +14,7 @@
+ #include "ggml-quants.h"
+ #include <cmath>
+ #include <cstring>
++#include <fstream>
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
+@@ -222,7 +223,7 @@ private:
+         // Load GGUF file
+         ggml_context *meta = nullptr;
+         gguf_init_params params;
+-        params.no_alloc = false;  // We need the data
++        params.no_alloc = true;  // embed.weight is read below; the rest of the file is not needed
+         params.ctx = &meta;
+ 
+         gguf_context *ctx_gguf = gguf_init_from_file(model_path.c_str(), params);
+@@ -269,7 +270,16 @@ private:
+         embed_type_ = embed_tensor->type;
+         size_t data_size = ggml_nbytes(embed_tensor);
+         embed_buffer_.resize(data_size);
+-        memcpy(embed_buffer_.data(), embed_tensor->data, data_size);
++        const int64_t tensor_id = gguf_find_tensor(ctx_gguf, "embed.weight");
++        std::ifstream fin(model_path, std::ios::binary);
++        fin.seekg(gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, tensor_id));
++        fin.read(reinterpret_cast<char *>(embed_buffer_.data()), data_size);
++        if (!fin) {
++            fprintf(stderr, "TextEmbed: failed to read embed.weight from %s\n", model_path.c_str());
++            gguf_free(ctx_gguf);
++            ggml_free(meta);
++            return false;
++        }
+         embed_data_ = embed_buffer_.data();
+ 
+         printf("TextEmbed: Loaded embedding table (%.2f MB, type=%d)\n",
+'''
+
+# Runs export_pi05.py unmodified (passing on any quantization flags given after the folders), with
+# two memory changes that do not alter its output: the 7.5 GB
 # bf16 state dict is read lazily, one tensor at a time, and GGUFWriter spills tensors to a temporary
 # file instead of keeping all 7 GB of FP16 arrays in RAM. As written it needs about 16-17 GB.
 EXPORT_WRAPPER = r'''
 import runpy, sys
-source, model_dir, output_dir = sys.argv[1:4]
+source, model_dir, output_dir, *quant_flags = sys.argv[1:]
 sys.path[:0] = [f"{source}/tools/pi0.5", f"{source}/gguf-py"]
 import gguf
 import safetensors.torch
@@ -141,7 +233,7 @@ class TempFileWriter(gguf.GGUFWriter):
 
 gguf.GGUFWriter = TempFileWriter
 script = f"{source}/tools/pi0.5/export_pi05.py"
-sys.argv = [script, "-d", model_dir, "-o", output_dir]
+sys.argv = [script, "-d", model_dir, "-o", output_dir, *quant_flags]
 runpy.run_path(script, run_name="__main__")
 '''
 
@@ -550,9 +642,9 @@ class Builder:
             "scope": "ActQuant Pi 0.5 build and a single-inference smoke test; no LIBERO rollout",
             "started_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "actquant": {"url": ACTQUANT_URL, "commit": ACTQUANT_COMMIT},
-            "checkpoint": ({"repo": CHECKPOINT_REPO, "revision": CHECKPOINT_REVISION} if args.model != "fp16"
+            "checkpoint": ({"repo": CHECKPOINT_REPO, "revision": CHECKPOINT_REVISION} if args.model not in EXPORTS
                            else {"base_repo": BASE_REPO, "base_revision": BASE_REVISION,
-                                 "export": "tools/pi0.5/export_pi05.py (FP16)"}),
+                                 "export": "tools/pi0.5/export_pi05.py", "export_flags": EXPORTS[args.model]}),
             "options": {"model": args.model,"stages": args.stages, "cuda_arch": self.arch, "no_vmm": args.no_vmm,
                         "no_flash_attn": args.no_flash_attn, "no_gpu": args.no_gpu,
                         "infer_device": args.infer_device,
@@ -579,7 +671,7 @@ class Builder:
 
     @property
     def package_name(self):
-        return f"actquant-pi05-{self._suffix}-{ACTQUANT_COMMIT[:7]}"
+        return f"actquant-pi05-{self._suffix}-{ACTQUANT_COMMIT[:7]}-{ACTQUANT_PATCH_ID}"
 
     @property
     def runtime_bin(self):
@@ -832,13 +924,24 @@ class Builder:
         head = _run([git, "-C", self.source, "rev-parse", "HEAD"])["output"].strip()
         if head != ACTQUANT_COMMIT:
             raise StageError(f"Checked-out commit {head} is not the pinned {ACTQUANT_COMMIT}.")
+        # Reset tracked files, then apply ACTQUANT_PATCH, so a rerun never patches twice.
+        _run([git, "-C", self.source, "checkout", "-q", "--", "."], timeout=300)
+        patch_file = self.work / f"actquant-{ACTQUANT_PATCH_ID}.patch"
+        patch_file.write_text(ACTQUANT_PATCH, encoding="utf-8", newline="\n")
+        applied = _run([git, "-C", self.source, "apply", "--ignore-whitespace", patch_file])
+        if applied["returncode"] != 0:
+            raise StageError("Applying ACTQUANT_PATCH failed.", {"output": applied["output"][-2000:]})
+        self.deviation("patch", f"ActQuant patched ({ACTQUANT_PATCH_ID}): each pi05 sub-model allocates only "
+                                "its own tensors, and the text embedding reads only embed.weight.")
         dirty = _run([git, "-C", self.source, "status", "--porcelain", "--untracked-files=no"])["output"]
         vendored = self.source / "vendor" / "tokenizers-cpp"
         if not vendored.is_dir():
             # As in ActQuant's README: unzip vendor/tokenizers-cpp.zip -d vendor/
             with zipfile.ZipFile(self.source / "vendor" / "tokenizers-cpp.zip") as archive:
                 archive.extractall(self.source / "vendor")
-        return {"commit": head, "path": str(self.source), "modified_tracked_files": dirty.splitlines(),
+        return {"commit": head, "path": str(self.source), "patch": ACTQUANT_PATCH_ID,
+                "patch_sha256": hashlib.sha256(ACTQUANT_PATCH.encode()).hexdigest(),
+                "modified_tracked_files": dirty.splitlines(),
                 "tokenizers_cpp": vendored.is_dir()}
 
     def _binding_plan(self):
@@ -1125,8 +1228,8 @@ class Builder:
         return details
 
     def stage_download(self):
-        if self.args.model == "fp16":
-            return self._fp16_checkpoint()
+        if self.args.model in EXPORTS:
+            return self._export_checkpoint()
         return self._download_release(self.checkpoint, CHECKPOINT_FILES)
 
     def _download_release(self, folder, files_wanted):
@@ -1160,61 +1263,68 @@ class Builder:
             resolved = None
         return {"path": str(folder), "files": files, "revision_resolved": resolved}
 
-    # ------------------------------------------------------------------ FP16 reference
+    # ------------------------------------------------------------------ FP16 and Q8_0 references
 
-    FP16_FILES = ("pi05.gguf", "tokenizer.model", "norm_stats.json", "eaq-export.json")
+    EXPORT_FILES = ("pi05.gguf", "tokenizer.model", "norm_stats.json", "eaq-export.json")
 
-    def _fp16_valid(self, folder):
-        """The export manifest of `folder` if its pi05.gguf matches it (and FP16_SHA256, if pinned)."""
+    def _export_valid(self, folder):
+        """The export manifest of `folder` if its pi05.gguf matches it (and EXPORT_SHA256, if pinned)."""
         try:
             manifest = json.loads((folder / "eaq-export.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
-        if not all((folder / name).is_file() for name in self.FP16_FILES):
+        if not all((folder / name).is_file() for name in self.EXPORT_FILES):
             return None
-        if FP16_SHA256 and manifest.get("sha256") != FP16_SHA256:
+        if manifest.get("export_flags", []) != EXPORTS[self.args.model]:
+            return None
+        pinned = EXPORT_SHA256[self.args.model]
+        if pinned and manifest.get("sha256") != pinned:
             return None
         return manifest if self._sha256(folder / "pi05.gguf") == manifest.get("sha256") else None
 
-    def _fp16_checkpoint(self):
-        """The FP16 reference: already in the work folder, copied from --model-cache, or exported."""
+    def _export_checkpoint(self):
+        """A reference export: already in the work folder, copied from --model-cache, or exported."""
+        model = self.args.model
+        label = {"fp16": "FP16", "q8": "Q8_0"}[model]
         cache = None
         if self.args.model_cache:
-            cache = Path(self.args.model_cache) / f"{MODELS['fp16']}-{BASE_REVISION[:7]}-{ACTQUANT_COMMIT[:7]}"
-        self.deviation("model_fp16", f"Reference model: FP16 export of {BASE_REPO}@{BASE_REVISION[:7]} by "
-                                     "ActQuant's tools/pi0.5/export_pi05.py (the file its 3-bit release is merged "
-                                     "into), run with a lazy state-dict loader and a temp-file GGUF writer. "
-                                     "norm_stats.json is the 3-bit release's, so only the weights differ.")
-        log("checking for an FP16 export in the work folder")
-        manifest = self._fp16_valid(self.checkpoint)
+            cache = Path(self.args.model_cache) / f"{MODELS[model]}-{BASE_REVISION[:7]}-{ACTQUANT_COMMIT[:7]}"
+        flags = " ".join(EXPORTS[model]) or "no quantization flags"
+        self.deviation(f"model_{model}", f"Reference model: {label} export of {BASE_REPO}@{BASE_REVISION[:7]} by "
+                                         f"ActQuant's tools/pi0.5/export_pi05.py ({flags}), run with a lazy "
+                                         "state-dict loader and a temp-file GGUF writer. norm_stats.json is the "
+                                         "3-bit release's, so only the weights differ.")
+        log(f"checking for a {label} export in the work folder")
+        manifest = self._export_valid(self.checkpoint)
         if manifest:
             return {"source": "work folder", "path": str(self.checkpoint), "manifest": manifest}
         if cache and (cache / "eaq-export.json").is_file():
-            log(f"copying the FP16 export from {cache}")
+            log(f"copying the {label} export from {cache}")
             started = time.monotonic()
             self.checkpoint.mkdir(parents=True, exist_ok=True)
-            for name in self.FP16_FILES:
+            for name in self.EXPORT_FILES:
                 shutil.copyfile(cache / name, self.checkpoint / name)
-            manifest = self._fp16_valid(self.checkpoint)
+            manifest = self._export_valid(self.checkpoint)
             if manifest:
                 return {"source": "cache", "cache": str(cache), "path": str(self.checkpoint),
                         "copy_seconds": round(time.monotonic() - started, 1), "manifest": manifest}
             log("the cached copy does not match its manifest; exporting again")
-        details = self._fp16_export()
+        details = self._export(label)
         if cache:
-            log(f"storing the FP16 export in {cache}")
+            log(f"storing the {label} export in {cache}")
             partial = cache.with_name(cache.name + ".partial")
             shutil.rmtree(partial, ignore_errors=True)
             partial.mkdir(parents=True)
-            for name in self.FP16_FILES:
+            for name in self.EXPORT_FILES:
                 shutil.copyfile(self.checkpoint / name, partial / name)
             shutil.rmtree(cache, ignore_errors=True)
             partial.rename(cache)
             details["cached_to"] = str(cache)
         return details
 
-    def _fp16_export(self):
+    def _export(self, label):
         started = time.monotonic()
+        model = self.args.model
         # The 3-bit release's tokenizer (the same 4,264,023-byte file as the gated
         # google/paligemma-3b-pt-224 tokenizer.model) and its quantile norm_stats.json.
         release = self.work / "checkpoints" / MODELS["actquant-3bpw"]
@@ -1225,18 +1335,19 @@ class Builder:
         source = self.stage_source()
         python = self._export_venv()
 
-        output = self.work / "fp16-export"
+        output = self.work / f"{model}-export"
         shutil.rmtree(output, ignore_errors=True)
         output.mkdir(parents=True)
-        scratch = self.work / "fp16-export-tmp"  # GGUFWriter's temp file: about 7 GB
+        scratch = self.work / f"{model}-export-tmp"  # GGUFWriter's temp file: up to about 7 GB
         scratch.mkdir(exist_ok=True)
         wrapper = self.work / "eaq_export_pi05.py"
         wrapper.write_text(EXPORT_WRAPPER, encoding="utf-8")
         env = {key: value for key, value in os.environ.items()
                if key not in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE", "VIRTUAL_ENV")}
         env.update(TMPDIR=str(scratch), PI05_OUTPUT_PRECISION="fp16", PYTHONUNBUFFERED="1")
-        log("exporting the FP16 model with export_pi05.py (CPU; several minutes)")
-        result = _stream([python, wrapper, self.source, base["dir"], output], self.output / "export_fp16.log",
+        log(f"exporting the {label} model with export_pi05.py (CPU; several minutes)")
+        result = _stream([python, wrapper, self.source, base["dir"], output, *EXPORTS[model]],
+                         self.output / f"export_{model}.log",
                          timeout=3600, env=env, echo=False)
         shutil.rmtree(scratch, ignore_errors=True)
         if result["returncode"] != 0 or not (output / "pi05.gguf").is_file():
@@ -1248,15 +1359,16 @@ class Builder:
         exported_stats = json.loads((output / "norm_stats.json").read_text(encoding="utf-8"))
         shutil.move(output / "norm_stats.json", output / "norm_stats.export.json")
         shutil.copyfile(release / "norm_stats.json", output / "norm_stats.json")
-        structure = self._compare_with_release(output / "pi05.gguf")
+        structure = self._compare_with_release(output / "pi05.gguf", label)
         digest = self._sha256(output / "pi05.gguf")
-        if FP16_SHA256 and digest != FP16_SHA256:
-            raise StageError(f"FP16 export SHA-256 {digest} differs from the pinned {FP16_SHA256}.",
+        pinned = EXPORT_SHA256[model]
+        if pinned and digest != pinned:
+            raise StageError(f"{label} export SHA-256 {digest} differs from the pinned {pinned}.",
                              {"structure": structure})
         manifest = {"sha256": digest, "bytes": (output / "pi05.gguf").stat().st_size,
                     "base": {"repo": BASE_REPO, "revision": BASE_REVISION},
                     "actquant_commit": ACTQUANT_COMMIT, "export": "tools/pi0.5/export_pi05.py",
-                    "precision": "fp16", "tokenizer_sha256": release_files["tokenizer.model"]["sha256"],
+                    "precision": model, "export_flags": EXPORTS[model], "tokenizer_sha256": release_files["tokenizer.model"]["sha256"],
                     "norm_stats": f"{CHECKPOINT_REPO}@{CHECKPOINT_REVISION[:7]}",
                     "exported_norm_stats_keys": sorted(exported_stats)}
         (output / "eaq-export.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -1321,7 +1433,7 @@ class Builder:
         marker.write_text(digest + "\n", encoding="utf-8")
         return python
 
-    def _compare_with_release(self, path):
+    def _compare_with_release(self, path, label):
         """Tensor names, shapes and types of the export against the 3-bit release's header."""
         with open(path, "rb") as handle:
             ours = gguf_tensor_table(handle.read(8 * 2**20))
@@ -1336,8 +1448,8 @@ class Builder:
         for name, (_, kind) in ours.items():
             types[name.split(".")[0]][kind] += 1
         missing, extra = sorted(set(theirs) - set(ours)), sorted(set(ours) - set(theirs))
-        # The release pads some K-quant tensors to 256 columns; FP16 tensors are not padded.
-        reshaped = {name: {"fp16": ours[name][0], "release": theirs[name][0]}
+        # The release pads some K-quant tensors to 256 columns; FP16 and Q8_0 tensors are not padded.
+        reshaped = {name: {"export": ours[name][0], "release": theirs[name][0]}
                     for name in sorted(set(ours) & set(theirs)) if ours[name][0] != theirs[name][0]}
         details = {"compared": True, "tensors": len(ours), "release_tensors": len(theirs),
                    "missing": missing[:20], "extra": extra[:20], "shape_differences": len(reshaped),
@@ -1347,7 +1459,7 @@ class Builder:
         # lerobot's checkpoint gives export_pi05.py mean/std only). The runtime does not read norm.*
         # tensors: serve_policy.py takes the stats from norm_stats.json, which is the release's here.
         if [name for name in missing if not name.startswith("norm.")] or extra:
-            raise StageError("The FP16 export's tensors differ from the 3-bit release's.", details)
+            raise StageError(f"The {label} export's tensors differ from the 3-bit release's.", details)
         return details
 
     @staticmethod
@@ -1514,9 +1626,9 @@ def main():
     parser.add_argument("--cpu-check", action="store_true", help="Also run the CLI on CPU and compare.")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--model", choices=list(MODELS), default="actquant-3bpw",
-                        help="the released 3-bit checkpoint, or the FP16 reference exported from its base")
+                        help="the released 3-bit checkpoint, or the FP16 or Q8_0 reference exported from its base")
     parser.add_argument("--model-cache", type=Path,
-                        help="folder to reuse an FP16 export from, and to store a new one in (e.g. Google Drive)")
+                        help="folder to reuse a reference export from, and to store a new one in (e.g. Google Drive)")
     parser.add_argument("--export-requirements", type=Path,
                         default=Path(__file__).resolve().parents[1] / "requirements" / "fp16-export.txt")
     parser.add_argument("--build-timeout", type=int, default=TIMEOUTS["build"])

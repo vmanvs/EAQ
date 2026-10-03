@@ -66,6 +66,8 @@ python3 cloud/colab_libero.py --suites libero_spatial --trials 1
 | `--trials` | 1 | Trials per task; ActQuant uses 50 |
 | `--stages` | `runtime,client,server,rollout` | `libero_rollout.py` stages; add `profile` to time inference before the rollout |
 | `--profile-requests` | 20 | Requests per phase of the profile stage |
+| `--model` | `actquant-3bpw` | `actquant-3bpw`, or a reference exported on the VM: `fp16` or `q8` (see [Reference models](#reference-models)) |
+| `--drive` | off | Mount Google Drive and keep reference exports in `MyDrive/eaq-cache/`, so later sessions copy them instead of exporting again |
 | `--session` | `eaq-libero` | Colab session name |
 | `--attach RUN` | | Resume watching a run already started in the session |
 | `--keep` | off | Leave the session running at the end |
@@ -80,6 +82,32 @@ the session ends, anything not yet downloaded is lost.
 Check `colab sessions` afterwards, and run `colab stop -s eaq-libero` if a
 session is still listed: a session left running counts against the GPU
 allowance even when idle.
+
+## Reference models
+
+To measure what 3-bit quantization costs, the same episodes are run with a
+higher-precision model on the same runtime. `actquant_build.py` exports it on
+the VM from the release's base checkpoint (`lerobot/pi05_libero_finetuned_v044`)
+with ActQuant's own `tools/pi0.5/export_pi05.py`, the script whose output the
+3-bit release is built from. The download and export take about 5 minutes.
+
+| `--model` | Export flags | Size | What it measures |
+| --- | --- | --- | --- |
+| `fp16` | none | 6.25 GB | The full-precision policy |
+| `q8` | `--quant_llm q8 --quant_vision q8 --quant_embedding q8` | about 3.7 GB (estimated) | The parts the release quantizes to 2–3 bits, at Q8_0 instead; the action expert stays FP16 in both |
+
+Both keep the 3-bit release's `norm_stats.json`, so only the weights differ.
+Use `--drive`: a VM's disk is wiped when its session stops, so without it the
+export is lost with the session.
+
+As released, ActQuant's runtime cannot run `fp16` on a T4. Its vision encoder,
+projector and action expert each open the whole `pi05.gguf` and allocated
+every tensor in it on the GPU, so the GPU held three copies of the file: about
+19 GB for FP16, against the T4's 15 GB. The source stage applies a patch
+(`ACTQUANT_PATCH` in `actquant_build.py`) so that each part allocates only its
+own tensors. The same patch has the text embedding read just its table rather
+than loading the whole file into RAM, where it stayed for the life of the
+process. Packages built with the patch have `-loadfix` in their name.
 
 ## Runtime package
 

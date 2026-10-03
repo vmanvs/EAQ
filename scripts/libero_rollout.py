@@ -59,10 +59,11 @@ SERVE_POLICY_URL = (f"https://raw.githubusercontent.com/arashakb/ActQuant/{ACTQU
                     "tools/pi0.5/serve_policy.py")
 SERVE_POLICY_SHA256 = "a82c2671209e28df052c5926558b3d642a9ad102b6e2afc34bb2fed98bdb7ab4"
 # Where actquant_build.py's download stage puts the checkpoint.
-# Model name: checkpoint folder in the work folder (as in actquant_build.py's MODELS). "fp16" is the
-# reference exported from the 3-bit release's base checkpoint by ActQuant's export_pi05.py.
+# Model name: checkpoint folder in the work folder (as in actquant_build.py's MODELS). "fp16" and
+# "q8" are references exported from the 3-bit release's base checkpoint by ActQuant's export_pi05.py.
 CHECKPOINTS = {"actquant-3bpw": Path("checkpoints") / "actquant-pi05-libero-3bpw",
-               "fp16": Path("checkpoints") / "pi05-libero-fp16"}
+               "fp16": Path("checkpoints") / "pi05-libero-fp16",
+               "q8": Path("checkpoints") / "pi05-libero-q8"}
 CLIENT_PYTHON = "3.8"
 FLOW_STEPS = 10  # run_libero_eval.sh: FLOW_STEPS=10
 STAGES = ("runtime", "client", "server", "profile", "rollout", "hold")
@@ -1327,8 +1328,8 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--device", default="CUDA0", help="ggml device for the policy server")
     parser.add_argument("--model", choices=list(CHECKPOINTS), default="actquant-3bpw",
-                        help="the released 3-bit checkpoint, or the FP16 reference exported from its base")
-    parser.add_argument("--model-cache", help="folder to reuse an FP16 export from and store one in")
+                        help="the released 3-bit checkpoint, or the FP16 or Q8_0 reference exported from its base")
+    parser.add_argument("--model-cache", help="folder to reuse a reference export from and store one in")
     parser.add_argument("--gl", default="auto", choices=["auto", *(name for name, _ in GL_CANDIDATES)])
     parser.add_argument("--client-threads", type=int, default=1,
                         help="cap for the client's thread pools (OpenMP, BLAS, numba, Mesa llvmpipe)")
