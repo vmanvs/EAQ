@@ -85,11 +85,22 @@ allowance even when idle.
 
 ## Reference models
 
+How these were built and what went wrong along the way, with the evidence, is
+in [the reference-model notes](reference-models.md).
+
 To measure what 3-bit quantization costs, the same episodes are run with a
 higher-precision model on the same runtime. `actquant_build.py` exports it on
-the VM from the release's base checkpoint (`lerobot/pi05_libero_finetuned_v044`)
-with ActQuant's own `tools/pi0.5/export_pi05.py`, the script whose output the
-3-bit release is built from. The download and export take about 5 minutes.
+the VM with ActQuant's own `tools/pi0.5/export_pi05.py`, the script whose
+output the 3-bit release is built from, from the checkpoint the release was
+made from: `lerobot/pi05_libero_base` (F32, 14.5 GB), with openpi's
+`pi05_libero` normalization stats.
+
+ActQuant's `02_prepare_models.sh` names `lerobot/pi05_libero_finetuned_v044`,
+but the release's unquantized tensors (action expert, projector, vision
+biases) are bit-identical to `pi05_libero_base` cast to fp16, and differ from
+v044's. v044 is a sibling fine-tune trained with mean/std normalization: FP16
+and Q8_0 exports of it succeeded in 5 and 6 of 10 episodes whose starting
+scenes the release solved 10 of 10.
 
 | `--model` | Export flags | Size | What it measures |
 | --- | --- | --- | --- |
@@ -97,11 +108,9 @@ with ActQuant's own `tools/pi0.5/export_pi05.py`, the script whose output the
 | `q8` | `--quant_llm q8 --quant_vision q8 --quant_embedding q8` | about 3.7 GB (estimated) | The parts the release quantizes to 2–3 bits, at Q8_0 instead; the action expert stays FP16 in both |
 
 Both keep the 3-bit release's `norm_stats.json`, so only the weights differ.
-They are exported with `action_horizon` 10, the release's value: lerobot's
-`config.json` gives `chunk_size` 50, and a horizon-50 FP16 export succeeded in
-4 of 10 episodes whose starting scenes the release solved 10 of 10. The export
-then fails if its metadata differs from the release's in anything but the
-quantization keys.
+They are exported with `action_horizon` 10, the release's value; lerobot's
+`config.json` gives `chunk_size` 50. The export then fails if its tensor names
+or metadata differ from the release's in anything but the quantization keys.
 Use `--drive`: a VM's disk is wiped when its session stops, so without it the
 export is lost with the session.
 

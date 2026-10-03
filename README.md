@@ -38,6 +38,12 @@ interval 96.1–98.8%). ActQuant reports 98.2%. With MuJoCo rendering on the GPU
 an episode takes about 19 s, so a suite fits in one Colab session. Next are
 `libero_10`, and a full-precision reference model on the same runtime.
 
+As of 2026-10-03, ActQuant's runtime runs an FP16 model on the T4 after a
+loader patch. The release turned out to be made from `lerobot/pi05_libero_base`,
+not the checkpoint its scripts name. Reference models exported from that
+checkpoint have not been run yet. See
+[the reference-model notes](docs/reference-models.md).
+
 ## Cloud validation
 
 ActQuant's Pi 0.5 runtime is compiled by

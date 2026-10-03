@@ -75,20 +75,24 @@ CHECKPOINT_FILES = {
     "tokenizer.model": "8986bb4f423f07f8c7f70d0dbe3526fb2316056c17bae71b1ea975e77a168fc6",
     "norm_stats.json": None,
 }
-# The FP16 reference: ActQuant's export_pi05.py run on the base checkpoint it quantizes. Its 3-bit
-# release is this FP16 file with the PaliGemma LLM swapped for a quantized one (merge_pi05_llm.py).
-BASE_REPO = "lerobot/pi05_libero_finetuned_v044"
-BASE_REVISION = "8e174154ef5f6c60a8da12ae99c303d8963138c1"
+# The references: ActQuant's export_pi05.py run on the checkpoint its 3-bit release was made from. Its
+# script names lerobot/pi05_libero_finetuned_v044, but the release's unquantized tensors (action
+# expert, projector, vision biases) are bit-identical to pi05_libero_base's F32 weights cast to fp16,
+# and differ from v044's (correlation 0.99). v044 was also trained with mean/std normalization; FP16
+# and Q8_0 exports of it scored 5/10 and 6/10 on scenes the release solved 10/10.
+BASE_REPO = "lerobot/pi05_libero_base"
+BASE_REVISION = "a217bfd3b14673cf2ce597e69997ab21866438dd"
 BASE_FILES = {
-    "model.safetensors": "877b3ec1130548b69af7f8aeef3ec9d3fc7738040f0b9beb490857ec970997ae",
+    "model.safetensors": "21b8711787c4a75861b02cff6aa81675a3a943d32b435a68262ac4461e476ba4",  # F32, 14.5 GB
     "config.json": None,
     "policy_preprocessor.json": None,
-    "policy_preprocessor_step_2_normalizer_processor.safetensors":
-        "a002c0df7f79c5b169c5a899ad151d4ea1bed246c7d82bd93ed1556558d517a9",
     "policy_postprocessor.json": None,
-    "policy_postprocessor_step_0_unnormalizer_processor.safetensors":
-        "a002c0df7f79c5b169c5a899ad151d4ea1bed246c7d82bd93ed1556558d517a9",
 }
+# openpi's pi05_libero normalization stats (quantile). The release's norm_stats.json holds the same
+# values; export_pi05.py reads them from assets/ and writes the norm.* tensors the release carries.
+OPENPI_NORM_STATS = ("https://storage.googleapis.com/openpi-assets/checkpoints/pi05_libero/assets/"
+                     "physical-intelligence/libero/norm_stats.json")
+OPENPI_NORM_STATS_SHA256 = "b3a44bb2810436fb62917decaea58bd4d9110255df527dea21e8fd40c960bd84"
 MODELS = {"actquant-3bpw": "actquant-pi05-libero-3bpw", "fp16": "pi05-libero-fp16",
           "q8": "pi05-libero-q8"}  # name: checkpoint folder
 # References exported from the base checkpoint by export_pi05.py: name -> its quantization flags.
@@ -1393,6 +1397,13 @@ class Builder:
         config = json.loads((base["dir"] / "config.json").read_text(encoding="utf-8"))
         (export_input / "config.json").write_text(json.dumps({**config, **EXPORT_CONFIG}, indent=2) + "\n",
                                                   encoding="utf-8")
+        assets = export_input / "assets" / "physical-intelligence" / "libero"
+        assets.mkdir(parents=True)
+        with urllib.request.urlopen(OPENPI_NORM_STATS, timeout=120) as response:
+            stats = response.read()
+        if hashlib.sha256(stats).hexdigest() != OPENPI_NORM_STATS_SHA256:
+            raise StageError("openpi's pi05_libero norm_stats.json does not match its pinned SHA-256.")
+        (assets / "norm_stats.json").write_bytes(stats)
         wrapper = self.work / "eaq_export_pi05.py"
         wrapper.write_text(EXPORT_WRAPPER, encoding="utf-8")
         env = {key: value for key, value in os.environ.items()
@@ -1515,10 +1526,7 @@ class Builder:
                    "missing": missing[:20], "extra": extra[:20], "shape_differences": len(reshaped),
                    "shape_examples": dict(list(reshaped.items())[:5]),
                    "types": {group: dict(counts) for group, counts in types.items()}}
-        # The release also carries quantile norm.*_q01/q99 tensors (its export read openpi's assets;
-        # lerobot's checkpoint gives export_pi05.py mean/std only). The runtime does not read norm.*
-        # tensors: serve_policy.py takes the stats from norm_stats.json, which is the release's here.
-        if [name for name in missing if not name.startswith("norm.")] or extra or metadata_differences:
+        if missing or extra or metadata_differences:
             raise StageError(f"The {label} export's tensors or metadata differ from the 3-bit release's.", details)
         return details
 

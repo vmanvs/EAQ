@@ -61,6 +61,27 @@ json.dump({{"pid": process.pid, "command": command}}, open(state, "w"))
 print(f"EAQ started pid {{process.pid}}")
 '''
 
+# Runs on the VM with --drive: every 10 s until the run ends, append memory, the largest processes, GPU
+# memory and the end of server.log to Drive, so the record survives a VM that dies (as one did, silently,
+# in the q8 server stage).
+DIAG = r'''
+import json, subprocess
+run, remote, drive = {run!r}, {remote!r}, {drive!r}
+pid = json.load(open(f"{{remote}}/runs/{{run}}.json"))["pid"]
+script = f"""
+mkdir -p {{drive}}/diag
+while kill -0 {{pid}} 2>/dev/null; do
+  {{{{ echo "=== $(date -u +%T)"; free -m | head -2; ps -eo rss,pid,args --sort=-rss | head -6 | cut -c1-160
+     nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader
+     tail -n 5 {{remote}}/runs/{{run}}/server.log 2>/dev/null; }}}} >> {{drive}}/diag/{{run}}.log
+  sleep 10
+done
+"""
+subprocess.Popen(["bash", "-c", script], start_new_session=True, stdin=subprocess.DEVNULL,
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print("EAQ diagnostics logging to " + f"{{drive}}/diag/{{run}}.log")
+'''
+
 # Runs on the VM: print new log lines until the run ends or the time is up, then pack the run folder.
 WATCH = r'''
 import json, os, tarfile, time
@@ -182,6 +203,9 @@ def main():
                         "--server-requirements", f"{REMOTE}/requirements/libero-server.txt"]
         colab("exec", "-s", args.session, "--timeout", "600",
               stdin=LAUNCH.format(run=run, remote=REMOTE, args=rollout_args))
+        if args.drive:
+            colab("exec", "-s", args.session, "--timeout", "120",
+                  stdin=DIAG.format(run=run, remote=REMOTE, drive=DRIVE_CACHE))
     print(f"[local] run {run}; copies go to {local_runs / run}", flush=True)
 
     while True:
