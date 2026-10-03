@@ -112,9 +112,38 @@ METADATA_MAY_DIFFER = {"pi05.quant_llm", "pi05.quant_vision", "pi05.quant_embedd
 # action expert each open the whole pi05.gguf and allocated every tensor in it on the device, so
 # the device held three copies of the file (6.25 GB FP16: ~19 GB, more than a T4's 15 GB). The
 # patch allocates each model's own tensors only, and has the text embedding read embed.weight
-# instead of the whole file into host RAM, where it stayed for the life of the process.
-ACTQUANT_PATCH_ID = "loadfix"
-ACTQUANT_PATCH = r'''diff --git a/tools/pi0.5/model_defs.cpp b/tools/pi0.5/model_defs.cpp
+# instead of the whole file into host RAM, where it stayed for the life of the process ("loadfix").
+# It also makes ggml's cuBLAS matrix products with F16 weights accumulate and write in fp32
+# ("fp32acc"). With fp16 accumulation, the default on NVIDIA, the FP16 export succeeded in 5 of 10
+# episodes whose starting scenes the 3-bit release solved 10 of 10; quantized weights take ggml's int8
+# kernels, which accumulate in fp32 anyway.
+ACTQUANT_PATCH_ID = "loadfix-fp32acc"
+ACTQUANT_PATCH = r'''diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index fb69152..d7a1cab 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1290,7 +1290,9 @@ static void ggml_cuda_op_mul_mat_cublas(
+ 
+         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+ 
+-        if (GGML_CUDA_CC_IS_CDNA(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
++        // EAQ: accumulate and write in fp32 on every GPU, as on CDNA/RDNA4. With fp16 accumulation, Pi 0.5's
++        // FP16 export (16384-term dot products in the Gemma MLP) lost to its own 3-bit quantization.
++        if (true) {
+             const float alpha = 1.0f;
+             const float beta = 0.0f;
+             CUBLAS_CHECK(
+@@ -1892,7 +1894,8 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
+     const float alpha_f32 = 1.0f;
+     const float beta_f32 = 0.0f;
+ 
+-    if (dst->op_params[0] == GGML_PREC_DEFAULT) {
++    // EAQ: F16 inputs accumulate and write in fp32 (the GGML_PREC_F32 branch), as in ggml_cuda_op_mul_mat_cublas.
++    if (dst->op_params[0] == GGML_PREC_DEFAULT && src0_type != GGML_TYPE_F16) {
+         if constexpr (src0_type == GGML_TYPE_F32) {
+             dst_t = (char *) dst_ddf;  // Direct F32 output
+         } else {
+diff --git a/tools/pi0.5/model_defs.cpp b/tools/pi0.5/model_defs.cpp
 index f2b2420..394cb0c 100644
 --- a/tools/pi0.5/model_defs.cpp
 +++ b/tools/pi0.5/model_defs.cpp
@@ -943,7 +972,8 @@ class Builder:
         if applied["returncode"] != 0:
             raise StageError("Applying ACTQUANT_PATCH failed.", {"output": applied["output"][-2000:]})
         self.deviation("patch", f"ActQuant patched ({ACTQUANT_PATCH_ID}): each pi05 sub-model allocates only "
-                                "its own tensors, and the text embedding reads only embed.weight.")
+                                "its own tensors, the text embedding reads only embed.weight, and cuBLAS "
+                                "products with F16 weights accumulate in fp32 instead of fp16.")
         dirty = _run([git, "-C", self.source, "status", "--porcelain", "--untracked-files=no"])["output"]
         vendored = self.source / "vendor" / "tokenizers-cpp"
         if not vendored.is_dir():
