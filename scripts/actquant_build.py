@@ -97,6 +97,16 @@ MODELS = {"actquant-3bpw": "actquant-pi05-libero-3bpw", "fp16": "pi05-libero-fp1
 EXPORTS = {"fp16": [], "q8": ["--quant_llm", "q8", "--quant_vision", "q8", "--quant_embedding", "q8"]}
 # SHA-256 of each export's pi05.gguf, once known; later exports and cached copies must match.
 EXPORT_SHA256 = {"fp16": None, "q8": None}
+# Added to the base checkpoint's config.json for the export, so the export's metadata matches the 3-bit
+# release's. export_pi05.py reads action_horizon first and falls back to chunk_size, which is 50 in
+# lerobot's config.json; the release has pi05_action.action_horizon = 10 (openpi's pi05_libero). A
+# horizon-50 FP16 export scored 4/10 on scenes the release solved 10/10.
+EXPORT_CONFIG = {"action_horizon": 10}
+# Metadata allowed to differ from the release's: what was quantized, and the vision mean/std, which the
+# export writes as [0.5, 0.5, 0.5] and the release as [0.5]. GGUF.* keys (the release's merge step copied
+# GGUFReader's virtual header fields in as metadata) are ignored too.
+METADATA_MAY_DIFFER = {"pi05.quant_llm", "pi05.quant_vision", "pi05.quant_embedding",
+                       "clip.vision.image_mean", "clip.vision.image_std"}
 
 # Applied to the ActQuant checkout by the source stage. The pi05 runtime's vision, projector and
 # action expert each open the whole pi05.gguf and allocated every tensor in it on the device, so
@@ -241,8 +251,8 @@ GGUF_TYPES = {0: "F32", 1: "F16", 2: "Q4_0", 8: "Q8_0", 10: "Q2_K", 11: "Q3_K", 
               14: "Q6_K", 16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 21: "IQ3_S", 22: "IQ2_S", 30: "BF16"}
 
 
-def gguf_tensor_table(data):
-    """{name: (shape, type)} from the start of a GGUF file (the header and tensor infos only)."""
+def gguf_header(data):
+    """({key: value}, {name: (shape, type)}) from the start of a GGUF file (metadata and tensor infos)."""
     pos = 0
 
     def take(fmt):
@@ -272,9 +282,10 @@ def gguf_tensor_table(data):
     pos = 4
     take("I")  # version
     n_tensors, n_kv = take("Q"), take("Q")
+    metadata = {}
     for _ in range(n_kv):
-        text()
-        value(take("I"))
+        key = text()
+        metadata[key] = value(take("I"))
     table = {}
     for _ in range(n_tensors):
         name = text()
@@ -282,7 +293,7 @@ def gguf_tensor_table(data):
         kind = take("I")
         take("Q")  # offset
         table[name] = (shape, GGUF_TYPES.get(kind, str(kind)))
-    return table
+    return metadata, table
 
 
 BUILD_TARGETS = ("pi05", "llama-quantize")
@@ -1275,7 +1286,8 @@ class Builder:
             return None
         if not all((folder / name).is_file() for name in self.EXPORT_FILES):
             return None
-        if manifest.get("export_flags", []) != EXPORTS[self.args.model]:
+        if (manifest.get("export_flags", []) != EXPORTS[self.args.model]
+                or manifest.get("config_overrides") != EXPORT_CONFIG):
             return None
         pinned = EXPORT_SHA256[self.args.model]
         if pinned and manifest.get("sha256") != pinned:
@@ -1291,7 +1303,8 @@ class Builder:
             cache = Path(self.args.model_cache) / f"{MODELS[model]}-{BASE_REVISION[:7]}-{ACTQUANT_COMMIT[:7]}"
         flags = " ".join(EXPORTS[model]) or "no quantization flags"
         self.deviation(f"model_{model}", f"Reference model: {label} export of {BASE_REPO}@{BASE_REVISION[:7]} by "
-                                         f"ActQuant's tools/pi0.5/export_pi05.py ({flags}), run with a lazy "
+                                         f"ActQuant's tools/pi0.5/export_pi05.py ({flags}; config.json plus "
+                                         f"{json.dumps(EXPORT_CONFIG)}), run with a lazy "
                                          "state-dict loader and a temp-file GGUF writer. norm_stats.json is the "
                                          "3-bit release's, so only the weights differ.")
         log(f"checking for a {label} export in the work folder")
@@ -1340,13 +1353,23 @@ class Builder:
         output.mkdir(parents=True)
         scratch = self.work / f"{model}-export-tmp"  # GGUFWriter's temp file: up to about 7 GB
         scratch.mkdir(exist_ok=True)
+        # The base files, linked, with config.json extended by EXPORT_CONFIG.
+        export_input = self.work / f"{model}-export-input"
+        shutil.rmtree(export_input, ignore_errors=True)
+        export_input.mkdir(parents=True)
+        for item in base["dir"].iterdir():
+            if item.is_file() and item.name != "config.json":
+                (export_input / item.name).symlink_to(item.resolve())
+        config = json.loads((base["dir"] / "config.json").read_text(encoding="utf-8"))
+        (export_input / "config.json").write_text(json.dumps({**config, **EXPORT_CONFIG}, indent=2) + "\n",
+                                                  encoding="utf-8")
         wrapper = self.work / "eaq_export_pi05.py"
         wrapper.write_text(EXPORT_WRAPPER, encoding="utf-8")
         env = {key: value for key, value in os.environ.items()
                if key not in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE", "VIRTUAL_ENV")}
         env.update(TMPDIR=str(scratch), PI05_OUTPUT_PRECISION="fp16", PYTHONUNBUFFERED="1")
         log(f"exporting the {label} model with export_pi05.py (CPU; several minutes)")
-        result = _stream([python, wrapper, self.source, base["dir"], output, *EXPORTS[model]],
+        result = _stream([python, wrapper, self.source, export_input, output, *EXPORTS[model]],
                          self.output / f"export_{model}.log",
                          timeout=3600, env=env, echo=False)
         shutil.rmtree(scratch, ignore_errors=True)
@@ -1368,7 +1391,8 @@ class Builder:
         manifest = {"sha256": digest, "bytes": (output / "pi05.gguf").stat().st_size,
                     "base": {"repo": BASE_REPO, "revision": BASE_REVISION},
                     "actquant_commit": ACTQUANT_COMMIT, "export": "tools/pi0.5/export_pi05.py",
-                    "precision": model, "export_flags": EXPORTS[model], "tokenizer_sha256": release_files["tokenizer.model"]["sha256"],
+                    "precision": model, "export_flags": EXPORTS[model], "config_overrides": EXPORT_CONFIG,
+                    "tokenizer_sha256": release_files["tokenizer.model"]["sha256"],
                     "norm_stats": f"{CHECKPOINT_REPO}@{CHECKPOINT_REVISION[:7]}",
                     "exported_norm_stats_keys": sorted(exported_stats)}
         (output / "eaq-export.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -1436,12 +1460,12 @@ class Builder:
     def _compare_with_release(self, path, label):
         """Tensor names, shapes and types of the export against the 3-bit release's header."""
         with open(path, "rb") as handle:
-            ours = gguf_tensor_table(handle.read(8 * 2**20))
+            our_metadata, ours = gguf_header(handle.read(8 * 2**20))
         url = f"https://huggingface.co/{CHECKPOINT_REPO}/resolve/{CHECKPOINT_REVISION}/pi05.gguf"
         try:  # the header only: the first megabytes, not the 2.4 GB file
             request = urllib.request.Request(url, headers={"Range": f"bytes=0-{8 * 2**20 - 1}"})
             with urllib.request.urlopen(request, timeout=120) as response:
-                theirs = gguf_tensor_table(response.read())
+                their_metadata, theirs = gguf_header(response.read())
         except Exception as exc:
             return {"compared": False, "reason": f"{type(exc).__name__}", "tensors": len(ours)}
         types = collections.defaultdict(collections.Counter)
@@ -1451,15 +1475,21 @@ class Builder:
         # The release pads some K-quant tensors to 256 columns; FP16 and Q8_0 tensors are not padded.
         reshaped = {name: {"export": ours[name][0], "release": theirs[name][0]}
                     for name in sorted(set(ours) & set(theirs)) if ours[name][0] != theirs[name][0]}
-        details = {"compared": True, "tensors": len(ours), "release_tensors": len(theirs),
+        metadata_differences = {
+            key: {"export": our_metadata.get(key), "release": their_metadata.get(key)}
+            for key in sorted(set(our_metadata) | set(their_metadata))
+            if not key.startswith(("tokenizer.", "GGUF.")) and key not in METADATA_MAY_DIFFER
+            and our_metadata.get(key) != their_metadata.get(key)}
+        details = {"compared": True, "metadata_differences": metadata_differences,
+                   "tensors": len(ours), "release_tensors": len(theirs),
                    "missing": missing[:20], "extra": extra[:20], "shape_differences": len(reshaped),
                    "shape_examples": dict(list(reshaped.items())[:5]),
                    "types": {group: dict(counts) for group, counts in types.items()}}
         # The release also carries quantile norm.*_q01/q99 tensors (its export read openpi's assets;
         # lerobot's checkpoint gives export_pi05.py mean/std only). The runtime does not read norm.*
         # tensors: serve_policy.py takes the stats from norm_stats.json, which is the release's here.
-        if [name for name in missing if not name.startswith("norm.")] or extra:
-            raise StageError(f"The {label} export's tensors differ from the 3-bit release's.", details)
+        if [name for name in missing if not name.startswith("norm.")] or extra or metadata_differences:
+            raise StageError(f"The {label} export's tensors or metadata differ from the 3-bit release's.", details)
         return details
 
     @staticmethod

@@ -97,6 +97,11 @@ with ActQuant's own `tools/pi0.5/export_pi05.py`, the script whose output the
 | `q8` | `--quant_llm q8 --quant_vision q8 --quant_embedding q8` | about 3.7 GB (estimated) | The parts the release quantizes to 2–3 bits, at Q8_0 instead; the action expert stays FP16 in both |
 
 Both keep the 3-bit release's `norm_stats.json`, so only the weights differ.
+They are exported with `action_horizon` 10, the release's value: lerobot's
+`config.json` gives `chunk_size` 50, and a horizon-50 FP16 export succeeded in
+4 of 10 episodes whose starting scenes the release solved 10 of 10. The export
+then fails if its metadata differs from the release's in anything but the
+quantization keys.
 Use `--drive`: a VM's disk is wiped when its session stops, so without it the
 export is lost with the session.
 
@@ -114,8 +119,9 @@ process. Packages built with the patch have `-loadfix` in their name.
 The T4 is sm_75. Its package is built by the
 [ActQuant build workflow](molab.md#building-the-package-github-actions) with
 `cuda_arch=75` and pinned in `requirements/actquant-prebuilt-sm75.json`
-(release r4). The package is built in a Debian 13 container but loads on
-Colab's Ubuntu 24.04: the highest glibc symbol versions it needs are
+(release r5, with the loader patch; r4, without it, produced the 489/500
+`libero_spatial` result). The package is built in a Debian 13 container but
+loads on Colab's Ubuntu 24.04: the highest glibc symbol versions it needs are
 GLIBC_2.38 and GLIBCXX_3.4.32, and Colab has 2.39 and 3.4.33.
 
 | Pin | GPU | Used by |

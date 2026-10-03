@@ -1,7 +1,7 @@
 {
-  "_comment": "ActQuant runtime for sm_75 (NVIDIA T4, Colab), fetched by cloud/colab_libero.py. Produced by .github/workflows/actquant-build.yml with cuda_arch=75; the fetch stage refuses a download whose SHA-256 differs.",
+  "_comment": "ActQuant runtime for sm_75 (NVIDIA T4, Colab), fetched by cloud/colab_libero.py. Produced by .github/workflows/actquant-build.yml with cuda_arch=75, with ACTQUANT_PATCH (loadfix) applied; the fetch stage refuses a download whose SHA-256 differs.",
   "repository": "vmanvs/EAQ",
-  "tag": "actquant-pi05-sm75-cu13.0-novmm-nofa-portable-b647911-r4",
-  "asset": "actquant-pi05-sm75-cu13.0-novmm-nofa-portable-b647911.tar.gz",
-  "sha256": "d5de48df311b9e5c10797660bbc5e36317f2b97c67fb995f80b68837bd31b405"
+  "tag": "actquant-pi05-sm75-cu13.0-novmm-nofa-portable-b647911-loadfix-r5",
+  "asset": "actquant-pi05-sm75-cu13.0-novmm-nofa-portable-b647911-loadfix.tar.gz",
+  "sha256": "9d7530f0801538d9664870b34af4c59b71e0cc0b85f6db473bff4efaea09f273"
 }

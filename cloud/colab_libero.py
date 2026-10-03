@@ -164,7 +164,12 @@ def main():
                                                   f"os.makedirs('{REMOTE}/' + d, exist_ok=True)\n")
         for path in UPLOADS:
             colab("upload", "-s", args.session, str(REPO / path), f"{REMOTE}/{path}")
-        if args.drive:
+        mounted = args.drive and "DRIVE_MOUNTED" in colab(  # the marker is split so an echo of the code can't match
+            "exec", "-s", args.session, capture=True, check=False,
+            stdin="import os\nprint('DRIVE_' + 'MOUNTED' if os.path.isdir('/content/drive/MyDrive') else 'absent')\n").stdout
+        if args.drive and not mounted:
+            # drivemount reads "press Enter" from the terminal: run this from an interactive one, or
+            # mount first with `colab drivemount -s <session> /content/drive` and rerun.
             print("[local] mounting Google Drive; approve the request if one appears", flush=True)
             colab("drivemount", "-s", args.session, "/content/drive")
         rollout_args = ["--model", args.model, *(["--model-cache", DRIVE_CACHE] if args.drive else []),
