@@ -40,8 +40,13 @@ an episode takes about 19 s, so a suite fits in one Colab session. Next are
 
 As of 2026-10-03, ActQuant's runtime runs an FP16 model on the T4 after a
 loader patch. The release turned out to be made from `lerobot/pi05_libero_base`,
-not the checkpoint its scripts name. Reference models exported from that
-checkpoint have not been run yet. See
+not the checkpoint its scripts name. As of 2026-10-30, the FP16 and Q8_0
+references exported from that checkpoint succeeded in 9 and 10 of 10
+`libero_spatial` smoke-test episodes, on starting scenes the 3-bit release
+solved 10 of 10. On the full `libero_spatial` suite, FP16 also succeeded in
+489 of 500 episodes; paired on the same initial states, the two models
+disagreed 7 times each way (McNemar p = 1.0), so 3-bit quantization costs
+nothing measurable there. `libero_10` is next. See
 [the reference-model notes](docs/reference-models.md).
 
 ## Cloud validation

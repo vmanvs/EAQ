@@ -100,12 +100,14 @@ but the release's unquantized tensors (action expert, projector, vision
 biases) are bit-identical to `pi05_libero_base` cast to fp16, and differ from
 v044's. v044 is a sibling fine-tune trained with mean/std normalization: FP16
 and Q8_0 exports of it succeeded in 5 and 6 of 10 episodes whose starting
-scenes the release solved 10 of 10.
+scenes the release solved 10 of 10. The FP16 and Q8_0 exports from
+`pi05_libero_base` succeeded in 9 and 10 of them (`20261030-174710-t1-fp16`,
+`20261030-180829-t1-q8`).
 
 | `--model` | Export flags | Size | What it measures |
 | --- | --- | --- | --- |
 | `fp16` | none | 6.25 GB | The full-precision policy |
-| `q8` | `--quant_llm q8 --quant_vision q8 --quant_embedding q8` | about 3.7 GB (estimated) | The parts the release quantizes to 2–3 bits, at Q8_0 instead; the action expert stays FP16 in both |
+| `q8` | `--quant_llm q8 --quant_vision q8 --quant_embedding q8` | 3.70 GB | The parts the release quantizes to 2–3 bits, at Q8_0 instead; the action expert stays FP16 in both |
 
 Both keep the 3-bit release's `norm_stats.json`, so only the weights differ.
 They are exported with `action_horizon` 10, the release's value; lerobot's

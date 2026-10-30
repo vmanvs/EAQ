@@ -6,20 +6,21 @@ reports 98.2%). To measure what the 3-bit quantization costs, the same
 episodes must be run with a higher-precision model on the same runtime: the
 release's unquantized parent (FP16) and a Q8_0 version of it. This document
 records how those references were built, the four problems found along the
-way, and the evidence for each. The setup itself is described in
+way, the evidence for each, and the first result from the corrected setup. The setup itself is described in
 [the Colab guide](colab.md#reference-models).
 
-## Status (2026-10-03)
+## Status (2026-10-30)
 
 | Item | State |
 | --- | --- |
 | Runtime fits FP16 on a T4 | Fixed by a loader patch (release r5) and verified on the GPU |
 | Export metadata matches the release | Fixed (`action_horizon` 10) and checked automatically |
-| Base checkpoint | **Corrected to `lerobot/pi05_libero_base`**. The FP16 and Q8_0 references from it have not been run yet |
-| fp16 accumulation in ggml's cuBLAS path | Real, but no measurable effect here. A patch is written but not built |
+| Base checkpoint | **Corrected to `lerobot/pi05_libero_base`**. On the 10 smoke-test scenes, FP16 from it succeeded in 9 and Q8_0 in 10 (section 5) |
+| FP16 against 3-bit, full `libero_spatial` | 489/500 for both; 7 against 7 discordant episodes, p = 1.0 (section 6) |
+| fp16 accumulation in ggml's cuBLAS path | Real, but no measurable effect on the corrected FP16 model either. A patch is written but not built, and is not needed for now |
 
-All reference runs so far used the wrong base checkpoint, so none of them
-measures the cost of quantization. They are kept below because they show how
+The runs before 2026-10-30 used the wrong base checkpoint, so they do not
+measure the cost of quantization. They are kept below because they show how
 each problem was found.
 
 ## 1. The runtime put three copies of the model on the GPU
@@ -163,6 +164,83 @@ fp32, as ggml already does on AMD CDNA. It would be named `loadfix-fp32acc`
 and released as r6. It is not built. Whether it is needed will be decided
 after the FP16 reference from the correct checkpoint has run.
 
+## 5. The references from the corrected checkpoint
+
+Runs `20261030-174710-t1-fp16` and `20261030-180829-t1-q8` exported FP16 and
+Q8_0 from `pi05_libero_base` on the VM. Both passed the structure check,
+including the `norm.*` tensors. Each export took 2–3 minutes, and the whole
+preparation stage, download included, about 8 minutes. The exports are
+cached on Drive as `eaq-cache/pi05-libero-{fp16,q8}-a217bfd-b647911`. The
+Q8_0 file is 3.70 GB.
+
+- **Episodes.** On the 10 scenes, FP16 succeeded in 9 (`111111111.`) and
+  Q8_0 in all 10. FP16's failure, "pick up the black bowl on the wooden
+  cabinet", is a task the release also failed once in 50 trials (49/50 in
+  `20261002-175720-t50`). With a single discordant scene, exact McNemar
+  p = 1.0: neither run shows a difference from the release.
+- **Probe.** Both references now lie close to the release in the
+  translation components, where the v044 exports were off by up to 1.5:
+
+  | Model | First action of the probe (raw, first 6 of 7) |
+  | --- | --- |
+  | 3-bit release | `0.426  0.611  0.215 -0.097  0.219 -0.233` |
+  | FP16, from `pi05_libero_base` | `0.381  0.451  0.180 -0.003  0.020 -0.001` |
+  | Q8_0, from `pi05_libero_base` | `0.392  0.457  0.191 -0.004  0.021 -0.001` |
+  | FP16, from v044 | `1.951  1.407  0.525 -0.041  0.463  0.156` |
+
+  FP16 and Q8_0 differ by at most 0.012. The 3-bit release differs from
+  both by up to 0.23, mostly in the rotation components. That is the
+  difference the references exist to measure; one probe input cannot show
+  how much it matters in closed loop.
+- **fp32 accumulation.** FP16 runs its large matrix products through cuBLAS
+  with fp16 accumulation, Q8_0 through MMQ with fp32 accumulation (section
+  4). Their probe actions agree to 0.012, against a 0.23 gap to the release,
+  so the r6 patch is not needed for this comparison.
+- **Speed.** pi05 took 500 ms (FP16) and 494 ms (Q8_0) per inference (p50)
+  during the rollout, against 563 ms for the 3-bit release. Successful
+  episodes took 13–19 s.
+
+## 6. FP16 against the 3-bit release on the full `libero_spatial` suite
+
+Run `20261030-185844-t50-fp16` ran FP16 from `pi05_libero_base` on all 500
+`libero_spatial` episodes (50 trials per task), with the same initial states
+as the 3-bit run `20261002-175720-t50`. Both runs are valid, with no server
+problems or client exceptions.
+
+- **Result.** FP16 succeeded in 489 of 500 (97.8%, 95% Wilson interval
+  96.1–98.8%), exactly the 3-bit release's total.
+- **Paired.** The two models disagreed on 14 of the 500 initial states: 7
+  solved only by the 3-bit release and 7 only by FP16. Exact McNemar
+  p = 1.0. On this suite the 3-bit quantization costs nothing measurable.
+
+| Task | 3-bit | FP16 | Only 3-bit | Only FP16 |
+| --- | --- | --- | --- | --- |
+| between the plate and the ramekin | 50 | 50 | 0 | 0 |
+| next to the ramekin | 43 | 46 | 1 | 4 |
+| from table center | 50 | 50 | 0 | 0 |
+| on the cookie box | 49 | 50 | 0 | 1 |
+| in the top drawer of the wooden cabinet | 50 | 49 | 1 | 0 |
+| on the ramekin | 50 | 50 | 0 | 0 |
+| next to the cookie box | 50 | 50 | 0 | 0 |
+| on the stove | 48 | 50 | 0 | 2 |
+| next to the plate | 50 | 50 | 0 | 0 |
+| on the wooden cabinet | 49 | 44 | 5 | 0 |
+| **Total** | **489** | **489** | **7** | **7** |
+
+The discordant episodes cluster in two tasks, in opposite directions: FP16
+did better on "next to the ramekin" and worse on "on the wooden cabinet",
+where all 5 disagreements favour the 3-bit model (exact p ≈ 0.06 for that
+task alone, chosen after seeing the data, so not evidence of a difference).
+Whether quantization shifts *which* tasks fail, while leaving the total
+unchanged, is a question for more trials or a harder suite.
+
+`libero_spatial` is near its ceiling for both models (97.8%), so it can show
+only large differences. `libero_10`, with longer tasks, is the more sensitive
+test.
+
+- **Speed.** pi05 took 496 ms per inference (p50). Episodes averaged 17.0 s,
+  and failed ones 33.4 s. The rollout took 2.6 hours.
+
 ## Runs
 
 All runs are on a Colab T4, `libero_spatial`. The "10 scenes" are trial 0 of
@@ -178,16 +256,21 @@ each of the 10 tasks, the same initial states in every run (`1` = success).
 | `20261003-065227-t1-fp16` | FP16 | v044 | r5 | `1.11.1..1.` | horizon 10; pi05 p50 483 ms |
 | `20261003-071712-t1-q8` | Q8_0 | v044 | r5 | — | VM lost in the server stage, no logs (below) |
 | `20261003-081936-t1-q8` | Q8_0 | v044 | r5 | `1.11.11.1.` | pi05 p50 518 ms |
+| `20261030-174710-t1-fp16` | FP16 | `pi05_libero_base` | r5 | `111111111.` | pi05 p50 500 ms (section 5) |
+| `20261030-180829-t1-q8` | Q8_0 | `pi05_libero_base` | r5 | `1111111111` | pi05 p50 494 ms (section 5) |
+| `20261030-185844-t50-fp16` | FP16 | `pi05_libero_base` | r5 | 489/500 | Paired with the 3-bit run: 7 against 7, p = 1.0 (section 6) |
 
 On the same 10 scenes:
 
+- FP16 from `pi05_libero_base` disagreed with the release once (p = 1.0),
+  and Q8_0 from it not at all;
 - the horizon-50 FP16 run disagreed with the release 6 times, every time
   failing where the release succeeded (exact McNemar p ≈ 0.03);
 - the horizon-10 FP16 run disagreed 5 times;
 - Q8_0 disagreed 4 times.
 
 Ten episodes are enough to show that something is wrong, not to rank models.
-The comparison itself is planned on 500 paired episodes per suite.
+The comparison itself uses 500 paired episodes per suite (section 6).
 
 **The lost VM.** In `20261003-071712-t1-q8`, the server stage started and the
 run printed nothing more. The Colab kernel stopped answering about 9 minutes
@@ -199,14 +282,14 @@ memory, the largest processes, GPU memory and the end of `server.log` to
 
 ## Next
 
-1. **FP16 smoke test.** Run 10 episodes of the FP16 reference from
-   `pi05_libero_base` on r5. Expected: close to the release on the same 10
-   scenes.
-2. **Q8_0 smoke test.** The same for Q8_0.
-3. **Decide on fp32 accumulation.** If FP16 trails Q8_0, build r6 with fp32
-   accumulation, and rerun the 3-bit smoke test on it, so both sides of the
-   comparison use the same runtime.
-4. **Paired comparison.** Run 500 episodes per model on `libero_spatial`, then
-   `libero_10`, on identical initial states. Compare with McNemar's test on
-   the discordant episodes.
+1. **FP16 smoke test.** Done: 9 of 10 (section 5).
+2. **Q8_0 smoke test.** Done: 10 of 10 (section 5).
+3. **Decide on fp32 accumulation.** Not needed for now: FP16 and Q8_0 agree
+   to 0.012 on the probe (section 5). Revisit if the 500-episode runs show
+   FP16 trailing Q8_0.
+4. **Paired comparison.** FP16 on `libero_spatial`: done, 489/500, no
+   difference from the 3-bit release (section 6). Still to run: Q8_0 on
+   `libero_spatial`, then the 3-bit release, FP16 and Q8_0 on `libero_10`,
+   on identical initial states, compared with McNemar's test on the
+   discordant episodes.
 5. **Pin the exports.** Record each export's SHA-256 in `EXPORT_SHA256`.
