@@ -112,42 +112,20 @@ EXPORT_CONFIG = {"action_horizon": 10}
 METADATA_MAY_DIFFER = {"pi05.quant_llm", "pi05.quant_vision", "pi05.quant_embedding",
                        "clip.vision.image_mean", "clip.vision.image_std"}
 
-# Applied to the ActQuant checkout by the source stage. The pi05 runtime's vision, projector and
-# action expert each open the whole pi05.gguf and allocated every tensor in it on the device, so
-# the device held three copies of the file (6.25 GB FP16: ~19 GB, more than a T4's 15 GB). The
-# patch allocates each model's own tensors only, and has the text embedding read embed.weight
-# instead of the whole file into host RAM, where it stayed for the life of the process ("loadfix").
-# It also makes ggml's cuBLAS matrix products with F16 weights accumulate and write in fp32
-# ("fp32acc"). With fp16 accumulation, the default on NVIDIA, the FP16 export succeeded in 5 of 10
-# episodes whose starting scenes the 3-bit release solved 10 of 10; quantized weights take ggml's int8
-# kernels, which accumulate in fp32 anyway.
-ACTQUANT_PATCH_ID = "loadfix-fp32acc"
-ACTQUANT_PATCH = r'''diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index fb69152..d7a1cab 100644
---- a/ggml/src/ggml-cuda/ggml-cuda.cu
-+++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -1290,7 +1290,9 @@ static void ggml_cuda_op_mul_mat_cublas(
- 
-         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
- 
--        if (GGML_CUDA_CC_IS_CDNA(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-+        // EAQ: accumulate and write in fp32 on every GPU, as on CDNA/RDNA4. With fp16 accumulation, Pi 0.5's
-+        // FP16 export (16384-term dot products in the Gemma MLP) lost to its own 3-bit quantization.
-+        if (true) {
-             const float alpha = 1.0f;
-             const float beta = 0.0f;
-             CUBLAS_CHECK(
-@@ -1892,7 +1894,8 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
-     const float alpha_f32 = 1.0f;
-     const float beta_f32 = 0.0f;
- 
--    if (dst->op_params[0] == GGML_PREC_DEFAULT) {
-+    // EAQ: F16 inputs accumulate and write in fp32 (the GGML_PREC_F32 branch), as in ggml_cuda_op_mul_mat_cublas.
-+    if (dst->op_params[0] == GGML_PREC_DEFAULT && src0_type != GGML_TYPE_F16) {
-         if constexpr (src0_type == GGML_TYPE_F32) {
-             dst_t = (char *) dst_ddf;  // Direct F32 output
-         } else {
-diff --git a/tools/pi0.5/model_defs.cpp b/tools/pi0.5/model_defs.cpp
+# Applied to the ActQuant checkout by the source stage; --patch picks one (the package name ends in
+# its key).
+#
+# "loadfix": the pi05 runtime's vision, projector and action expert each open the whole pi05.gguf
+# and allocated every tensor in it on the device, so the device held three copies of the file
+# (6.25 GB FP16: ~19 GB, more than a T4's 15 GB). The patch allocates each model's own tensors only,
+# and has the text embedding read embed.weight instead of the whole file into host RAM, where it
+# stayed for the life of the process. Releases r5 (sm_75) on are built with it.
+#
+# "loadfix-fp32acc" also makes ggml's cuBLAS matrix products with F16 weights accumulate and write
+# in fp32, as ggml does on AMD CDNA; on NVIDIA they accumulate in fp16. Quantized weights take
+# ggml's int8 kernels, which accumulate in fp32 anyway. Not built: FP16 and Q8_0 exports from
+# pi05_libero_base give probe actions within 0.012 of each other (docs/reference-models.md).
+LOADFIX_PATCH = r'''diff --git a/tools/pi0.5/model_defs.cpp b/tools/pi0.5/model_defs.cpp
 index f2b2420..394cb0c 100644
 --- a/tools/pi0.5/model_defs.cpp
 +++ b/tools/pi0.5/model_defs.cpp
@@ -225,6 +203,33 @@ index 9a38162..451b8d8 100644
  
          printf("TextEmbed: Loaded embedding table (%.2f MB, type=%d)\n",
 '''
+FP32ACC_PATCH = r'''diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index fb69152..d7a1cab 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1290,7 +1290,9 @@ static void ggml_cuda_op_mul_mat_cublas(
+ 
+         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+ 
+-        if (GGML_CUDA_CC_IS_CDNA(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
++        // EAQ: accumulate and write in fp32 on every GPU, as on CDNA/RDNA4. With fp16 accumulation, Pi 0.5's
++        // FP16 export (16384-term dot products in the Gemma MLP) lost to its own 3-bit quantization.
++        if (true) {
+             const float alpha = 1.0f;
+             const float beta = 0.0f;
+             CUBLAS_CHECK(
+@@ -1892,7 +1894,8 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
+     const float alpha_f32 = 1.0f;
+     const float beta_f32 = 0.0f;
+ 
+-    if (dst->op_params[0] == GGML_PREC_DEFAULT) {
++    // EAQ: F16 inputs accumulate and write in fp32 (the GGML_PREC_F32 branch), as in ggml_cuda_op_mul_mat_cublas.
++    if (dst->op_params[0] == GGML_PREC_DEFAULT && src0_type != GGML_TYPE_F16) {
+         if constexpr (src0_type == GGML_TYPE_F32) {
+             dst_t = (char *) dst_ddf;  // Direct F32 output
+         } else {
+'''
+ACTQUANT_PATCHES = {"loadfix": LOADFIX_PATCH, "loadfix-fp32acc": FP32ACC_PATCH + LOADFIX_PATCH}
 
 # Runs export_pi05.py unmodified (passing on any quantization flags given after the folders), with
 # two memory changes that do not alter its output: the 7.5 GB
@@ -715,7 +720,7 @@ class Builder:
 
     @property
     def package_name(self):
-        return f"actquant-pi05-{self._suffix}-{ACTQUANT_COMMIT[:7]}-{ACTQUANT_PATCH_ID}"
+        return f"actquant-pi05-{self._suffix}-{ACTQUANT_COMMIT[:7]}-{self.args.patch}"
 
     @property
     def runtime_bin(self):
@@ -968,24 +973,26 @@ class Builder:
         head = _run([git, "-C", self.source, "rev-parse", "HEAD"])["output"].strip()
         if head != ACTQUANT_COMMIT:
             raise StageError(f"Checked-out commit {head} is not the pinned {ACTQUANT_COMMIT}.")
-        # Reset tracked files, then apply ACTQUANT_PATCH, so a rerun never patches twice.
+        # Reset tracked files, then apply the patch, so a rerun never patches twice.
         _run([git, "-C", self.source, "checkout", "-q", "--", "."], timeout=300)
-        patch_file = self.work / f"actquant-{ACTQUANT_PATCH_ID}.patch"
-        patch_file.write_text(ACTQUANT_PATCH, encoding="utf-8", newline="\n")
+        patch = ACTQUANT_PATCHES[self.args.patch]
+        patch_file = self.work / f"actquant-{self.args.patch}.patch"
+        patch_file.write_text(patch, encoding="utf-8", newline="\n")
         applied = _run([git, "-C", self.source, "apply", "--ignore-whitespace", patch_file])
         if applied["returncode"] != 0:
-            raise StageError("Applying ACTQUANT_PATCH failed.", {"output": applied["output"][-2000:]})
-        self.deviation("patch", f"ActQuant patched ({ACTQUANT_PATCH_ID}): each pi05 sub-model allocates only "
-                                "its own tensors, the text embedding reads only embed.weight, and cuBLAS "
-                                "products with F16 weights accumulate in fp32 instead of fp16.")
+            raise StageError(f"Applying the {self.args.patch} patch failed.", {"output": applied["output"][-2000:]})
+        self.deviation("patch", f"ActQuant patched ({self.args.patch}): each pi05 sub-model allocates only "
+                                "its own tensors and the text embedding reads only embed.weight"
+                                + (", and cuBLAS products with F16 weights accumulate in fp32 instead of fp16."
+                                   if "fp32acc" in self.args.patch else "."))
         dirty = _run([git, "-C", self.source, "status", "--porcelain", "--untracked-files=no"])["output"]
         vendored = self.source / "vendor" / "tokenizers-cpp"
         if not vendored.is_dir():
             # As in ActQuant's README: unzip vendor/tokenizers-cpp.zip -d vendor/
             with zipfile.ZipFile(self.source / "vendor" / "tokenizers-cpp.zip") as archive:
                 archive.extractall(self.source / "vendor")
-        return {"commit": head, "path": str(self.source), "patch": ACTQUANT_PATCH_ID,
-                "patch_sha256": hashlib.sha256(ACTQUANT_PATCH.encode()).hexdigest(),
+        return {"commit": head, "path": str(self.source), "patch": self.args.patch,
+                "patch_sha256": hashlib.sha256(patch.encode()).hexdigest(),
                 "modified_tracked_files": dirty.splitlines(),
                 "tokenizers_cpp": vendored.is_dir()}
 
@@ -1688,6 +1695,8 @@ def main():
     parser.add_argument("--infer-device", default="CUDA0", help="ggml device for the infer stage (CUDA0 or CPU).")
     parser.add_argument("--jobs", type=int, help=f"Parallel build jobs (default: CPUs, limited by memory, at most {DEFAULT_MAX_JOBS}).")
     parser.add_argument("--no-vmm", action="store_true", help="Build with GGML_CUDA_NO_VMM=ON.")
+    parser.add_argument("--patch", choices=list(ACTQUANT_PATCHES), default="loadfix",
+                        help="Patch applied to the ActQuant source; see ACTQUANT_PATCHES.")
     parser.add_argument("--no-flash-attn", action="store_true",
                         help="Build with GGML_CUDA_FA=OFF (FlashAttention kernels as stubs; shorter build).")
     parser.add_argument("--no-binding", action="store_true", help="Do not build the pi05.so Python binding.")
